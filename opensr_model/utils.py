@@ -8,6 +8,130 @@ from scipy.ndimage import gaussian_filter
 def linear_transform_placeholder(t_input, stage="norm"):
     return( t_input )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S1+S2 Fusion normalization functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_s2(t_input, stage="norm"):
+    """Normalize / denormalize Sentinel-2 RGBNIR (4 channels).
+
+    S2 L2A surface reflectance is stored as DN (digital number) values that are
+    typically 0–10 000 (where 10 000 = 100 % reflectance).  In our pipeline the
+    values are cast to float32, so they arrive here in roughly the 0–3 000 range
+    for RGB and 0–5 000 for NIR.
+
+    Norm:   raw  →  scale to [0, 1]  →  clamp  →  map to [-1, 1]
+    Denorm: [-1, 1]  →  [0, 1]  →  invert scale  →  clamp
+    """
+    assert stage in ("norm", "denorm")
+
+    # Per-channel divisor: maps typical max reflectance DN to ~1.0
+    # RGB bands (B02/B03/B04): typical max ~3000 DN
+    # NIR  band (B08):         typical max ~5000 DN
+    RGB_DIVISOR = 3000.0
+    NIR_DIVISOR = 5000.0
+
+    t = t_input.clone()
+
+    # Ensure (B, C, H, W)
+    squeeze = False
+    if t.dim() == 3:
+        t = t.unsqueeze(0)
+        squeeze = True
+
+    if stage == "norm":
+        t[:, 0] = t[:, 0] / RGB_DIVISOR   # B02 (Blue)
+        t[:, 1] = t[:, 1] / RGB_DIVISOR   # B03 (Green)
+        t[:, 2] = t[:, 2] / RGB_DIVISOR   # B04 (Red)
+        t[:, 3] = t[:, 3] / NIR_DIVISOR   # B08 (NIR)
+        t = t.clamp(0, 1)
+        t = t * 2 - 1                      # [0,1] → [-1,1]
+    else:  # denorm
+        t = (t + 1) / 2                    # [-1,1] → [0,1]
+        t[:, 0] = t[:, 0] * RGB_DIVISOR
+        t[:, 1] = t[:, 1] * RGB_DIVISOR
+        t[:, 2] = t[:, 2] * RGB_DIVISOR
+        t[:, 3] = t[:, 3] * NIR_DIVISOR
+        t = t.clamp(0)
+
+    if squeeze:
+        t = t.squeeze(0)
+    return t
+
+
+def normalize_s1(t_input, stage="norm"):
+    """Normalize / denormalize Sentinel-1 VV/VH (2 channels, dB scale).
+
+    The pipeline converts S1 linear backscatter to dB via:
+        10 * log10(max(linear, 1e-10))
+
+    Typical dB ranges over land:
+        VV: −25 dB  to  0 dB   (smooth water can go to −30)
+        VH: −32 dB  to −5 dB
+
+    We use a generous range per channel to capture most values, then
+    linearly map to [-1, 1].
+
+    Norm:   dB  →  clip to [min, max]  →  scale to [0, 1]  →  map to [-1, 1]
+    Denorm: [-1, 1]  →  [0, 1]  →  invert scale  →  dB
+    """
+    assert stage in ("norm", "denorm")
+
+    # Expected dB range per channel
+    VV_MIN, VV_MAX = -30.0,  0.0
+    VH_MIN, VH_MAX = -35.0, -5.0
+
+    t = t_input.clone()
+
+    squeeze = False
+    if t.dim() == 3:
+        t = t.unsqueeze(0)
+        squeeze = True
+
+    if stage == "norm":
+        # Clip to expected range
+        t[:, 0] = t[:, 0].clamp(VV_MIN, VV_MAX)
+        t[:, 1] = t[:, 1].clamp(VH_MIN, VH_MAX)
+        # Scale to [0, 1]
+        t[:, 0] = (t[:, 0] - VV_MIN) / (VV_MAX - VV_MIN)
+        t[:, 1] = (t[:, 1] - VH_MIN) / (VH_MAX - VH_MIN)
+        # Map to [-1, 1]
+        t = t * 2 - 1
+    else:  # denorm
+        t = (t + 1) / 2                          # [-1,1] → [0,1]
+        t[:, 0] = t[:, 0] * (VV_MAX - VV_MIN) + VV_MIN
+        t[:, 1] = t[:, 1] * (VH_MAX - VH_MIN) + VH_MIN
+
+    if squeeze:
+        t = t.squeeze(0)
+    return t
+
+
+def normalize_aerial(t_input, stage="norm"):
+    """Normalize / denormalize aerial orthophoto RGBNIR (4 channels, uint8).
+
+    Aerial photos from the pipeline are stored as uint8 [0, 255].
+    We simply scale linearly to [-1, 1].
+
+    Norm:   [0, 255]  →  [0, 1]  →  [-1, 1]
+    Denorm: [-1, 1]  →  [0, 1]  →  [0, 255]
+    """
+    assert stage in ("norm", "denorm")
+
+    t = t_input.clone().float()
+
+    if stage == "norm":
+        t = t / 255.0           # [0,255] → [0,1]
+        t = t * 2 - 1           # [0,1]   → [-1,1]
+    else:  # denorm
+        t = (t + 1) / 2         # [-1,1]  → [0,1]
+        t = t * 255.0           # [0,1]   → [0,255]
+        t = t.clamp(0, 255)
+
+    return t
+
+
 def linear_transform_4b(t_input,stage="norm"):
     assert stage in ["norm","denorm"]
     # get the shape of the tensor

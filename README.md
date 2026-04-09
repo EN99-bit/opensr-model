@@ -120,9 +120,77 @@ Use the notebooks and `demo.py` for quick starts; for full‑tile processing and
 # 5. 📝 Notes
 
 ## 5.1 🎓 Training
+
+Training is supported via `train_unet.py`, a **PyTorch Lightning** script that trains the UNet denoiser with S1+S2 fusion conditioning in latent space. See `CHANGES.md` for a full summary of adaptations.
+
+### Quick Start
+```bash
+python train_unet.py \
+    --data_dir /path/to/npz_tiles \
+    --vae_ckpt /path/to/vae.ckpt \
+    --epochs 100 \
+    --batch_size 4 \
+    --precision 16-mixed \
+    --devices 1
+```
+
+### Key Arguments
+| Argument | Default | Description |
+|---|---|---|
+| `--data_dir` | *(required)* | Path to directory with NPZ files |
+| `--vae_ckpt` | `None` | Path to pretrained VAE checkpoint |
+| `--epochs` | `100` | Number of training epochs |
+| `--batch_size` | `2` | Batch size per device |
+| `--lr` | `1e-4` | Learning rate |
+| `--train_frac` | `0.8` | Fraction of data for training |
+| `--val_frac` | `0.1` | Fraction of data for validation |
+| `--test_frac` | `0.1` | Fraction of data for testing |
+| `--precision` | `32` | Precision (`32`, `16-mixed`, `bf16-mixed`) |
+| `--devices` | `1` | Number of GPUs (0 = CPU) |
+
+### Monitoring
+```bash
+tensorboard --logdir lightning_logs
+```
+Checkpoints are saved to `checkpoints/unet/` (top 3 by `val_loss` + `last.ckpt`).
+
+## 5.2 🖥️ Server Deployment
+
+### Copy to Server
+```bash
+rsync -avz --exclude '.venv' --exclude '__pycache__' --exclude 'data/' \
+    --exclude '.git' --exclude 'test/' --exclude 'lightning_logs/' \
+    opensr-model/ user@server:/path/to/opensr-model/
+```
+
+### Setup on Server
+```bash
+cd /path/to/opensr-model
+python -m venv .venv
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPUs: {torch.cuda.device_count()}')"
+```
+
+### Run Training
+```bash
+python train_unet.py \
+    --data_dir /path/to/npz_tiles \
+    --vae_ckpt /path/to/vae.ckpt \
+    --epochs 100 \
+    --batch_size 4 \
+    --precision 16-mixed \
+    --devices 1
+```
+
+## 5.3 🎓 Training (original)
 Training is **not supported by default** in this repository due to time and resource constraints. The provided models are implemented as **PyTorch Lightning** modules and ship ready for inference. If you want to train or fine‑tune them, you can extend the module(s) by adding the standard Lightning hooks (e.g., `training_step`, `validation_step`, `configure_optimizers`, and any callbacks or loggers you prefer). If you build a clean, reproducible training pipeline, please consider opening a Pull Request (PR). We’re happy to review community contributions.
 
-## 5.2 📚 Citation
+## 5.4 📚 Citation
 If you use this model in your work, please cite  
 ```tex
 @ARTICLE{ldsrs2,
@@ -136,6 +204,6 @@ If you use this model in your work, please cite
   doi={10.1109/JSTARS.2025.3542220}}
 ```
 
-## 5.3 📈 Status
+## 5.5 📈 Status
 This repository has left the experimental stage with the publication of v1.0.0.   
 [![PyPI Downloads](https://static.pepy.tech/badge/opensr-model)](https://pepy.tech/projects/opensr-model)

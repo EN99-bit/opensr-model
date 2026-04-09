@@ -1,5 +1,9 @@
+.idea/
 .vscode
 .vscode/*
+data/
+lightning_logs/
+checkpoints/
 *.swp
 other_uncertainty_2.py
 sr_of_s2_tile.py

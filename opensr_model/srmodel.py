@@ -18,6 +18,7 @@ from opensr_model.utils import assert_tensor_validity
 from opensr_model.utils import revert_padding
 from opensr_model.utils import create_no_data_mask
 from opensr_model.utils import apply_no_data_mask
+from opensr_model.utils import normalize_s1, normalize_s2, normalize_aerial
 
 
 
@@ -26,7 +27,7 @@ class SRLatentDiffusion(torch.nn.Module):
         super().__init__()
 
         # Set up the model
-        self.config = config        
+        self.config = config
         self.model = LatentDiffusion(
             config.first_stage_config,
             config.cond_stage_config,
@@ -48,8 +49,16 @@ class SRLatentDiffusion(torch.nn.Module):
         self.model = self.model.to(device) # move model to device
         self.model.eval() # set model state
         self = self.eval() # set main model state
-        self._X = None # placeholder for LR image
+        self._X_s2 = None # placeholder for LR S2 image (used in histogram matching)
         self.encode_conditioning = config.encode_conditioning # encode LR images before dif?
+
+        # Scale factor: LR→HR spatial ratio (original=4, S1+S2 fusion=10)
+        self.scale_factor = getattr(config, 'scale_factor', 4)
+        # VAE spatial downscale factor: 2^(num_downsample_steps)
+        ch_mult = list(config.first_stage_config.ch_mult)
+        self.vae_downscale = 2 ** (len(ch_mult) - 1)
+        # Number of VAE latent channels
+        self.z_channels = config.first_stage_config.z_channels
 
     def set_normalization(self):
         if self.config.apply_normalization==True:
@@ -59,60 +68,114 @@ class SRLatentDiffusion(torch.nn.Module):
             from opensr_model.utils import linear_transform_placeholder
             self.linear_transform = linear_transform_placeholder
             print("Normalization disabled.")
-        
-    def _tensor_encode(self,X: torch.Tensor):
-        # set copy to model
-        self._X = X.clone()
-        # normalize image
-        X_enc = self.linear_transform(X, stage="norm")
-        # encode LR images
-        if self.encode_conditioning==True :
-            # try to upsample->encode conditioning
-            X_int = torch.nn.functional.interpolate(X, size=(X.shape[-1]*4,X.shape[-1]*4), mode='bilinear', align_corners=False)
-            # encode conditioning
-            X_enc = self.model.first_stage_model.encode(X_int).sample()
-        # move to same device as the model
-        X_enc = X_enc.to(self.device)
-        return X_enc
+
+    def _tensor_encode(self, X_s2: torch.Tensor, X_s1: torch.Tensor):
+        """Encode S2 and S1 inputs into a fused conditioning tensor in latent space.
+
+        S2 (4ch) is upsampled to HR size and encoded through the VAE to get a
+        4-channel latent representation.  S1 (2ch) is upsampled directly to the
+        same latent spatial size (it cannot pass through the 4-ch VAE).
+        The two are concatenated to form a 6-channel conditioning tensor.
+
+        Args:
+            X_s2: (B, 4, H, W) Sentinel-2 RGBNIR at LR resolution.
+            X_s1: (B, 2, H, W) Sentinel-1 VV/VH at LR resolution.
+
+        Returns:
+            conditioning: (B, 6, latent_H, latent_W) fused conditioning tensor.
+        """
+        # Store S2 copy for histogram matching during decode
+        self._X_s2 = X_s2.clone()
+
+        # Compute target sizes
+        lr_size = X_s2.shape[-1]                          # e.g. 128
+        hr_size = lr_size * self.scale_factor              # e.g. 128 * 10 = 1280
+        latent_size = hr_size // self.vae_downscale        # e.g. 1280 / 4 = 320
+
+        # --- S2 conditioning (4ch) ---
+        # Normalize S2 reflectance DN → [-1, 1]
+        X_s2_norm = normalize_s2(X_s2, stage="norm")
+        if self.encode_conditioning:
+            # Upsample to HR size, then encode through VAE → 4ch latent
+            X_s2_up = torch.nn.functional.interpolate(
+                X_s2_norm,
+                size=(hr_size, hr_size),
+                mode='bilinear',
+                align_corners=False
+            )
+            cond_s2 = self.model.first_stage_model.encode(X_s2_up).sample()
+        else:
+            # Skip VAE, just resize to latent spatial size
+            cond_s2 = torch.nn.functional.interpolate(
+                X_s2_norm,
+                size=(latent_size, latent_size),
+                mode='bilinear',
+                align_corners=False
+            )
+
+        # --- S1 conditioning (2ch) ---
+        # Normalize S1 dB → [-1, 1]
+        X_s1_norm = normalize_s1(X_s1, stage="norm")
+        # Upsample directly to latent spatial size
+        cond_s1 = torch.nn.functional.interpolate(
+            X_s1_norm,
+            size=(latent_size, latent_size),
+            mode='bilinear',
+            align_corners=False
+        )
+
+        # --- Fuse: concat S2 latent (4ch) + S1 (2ch) → 6ch conditioning ---
+        conditioning = torch.cat([cond_s2, cond_s1], dim=1)
+        conditioning = conditioning.to(self.device)
+        return conditioning
 
     def _tensor_decode(self, X_enc: torch.Tensor, spe_cor: bool = True):       
-        # Decode
+        # Decode VAE latent → aerial image
         X_dec = self.model.decode_first_stage(X_enc)
-        X_dec = self.linear_transform(X_dec, stage="denorm")
-        # Apply spectral correction
-        if spe_cor:
-            for i in range(X_dec.shape[1]):
-                X_dec[:, i] = self.hq_histogram_matching(X_dec[:, i], self._X[:, i])
+        # Denormalize aerial output: [-1,1] → [0,255]
+        X_dec = normalize_aerial(X_dec, stage="denorm")
+        # Apply spectral correction using stored S2 LR reference
+        if spe_cor and self._X_s2 is not None:
+            n_match = min(X_dec.shape[1], self._X_s2.shape[1])
+            for i in range(n_match):
+                X_dec[:, i] = self.hq_histogram_matching(X_dec[:, i], self._X_s2[:, i])
         # If the value is negative, set it to 0
         X_dec[X_dec < 0] = 0    
         return X_dec
-    
+
     def _prepare_model(
         self,
-        X: torch.Tensor,
+        conditioning: torch.Tensor,
         eta: float = 1.0,
         custom_steps: int = 100,
-        verbose: bool = False 
+        verbose: bool = False
     ):
         # Create the DDIM sampler
         ddim = DDIMSampler(self.model)
-        
+
         # make schedule to compute alphas and sigmas
         ddim.make_schedule(ddim_num_steps=custom_steps, ddim_eta=eta, verbose=verbose)
-        
-        # Create the HR latent image
-        latent = torch.randn(X.shape, device=X.device)
-                
+
+        # Create the HR latent noise — 4ch (z_channels), same spatial as conditioning
+        latent_shape = (
+            conditioning.shape[0],      # batch size
+            self.z_channels,            # 4 (VAE latent channels)
+            conditioning.shape[2],      # latent H (e.g. 320)
+            conditioning.shape[3],      # latent W (e.g. 320)
+        )
+        latent = torch.randn(latent_shape, device=conditioning.device)
+
         # Create the vector with the timesteps
         timesteps = ddim.ddim_timesteps
         time_range = np.flip(timesteps)
-        
+
         return ddim, latent, time_range
 
     @torch.no_grad()
     def forward(
         self,
-        X: torch.Tensor,
+        X_s2: torch.Tensor,
+        X_s1: torch.Tensor,
         sampling_eta: float = None,
         sampling_steps: int = None,
         sampling_temperature: float = None,
@@ -120,24 +183,20 @@ class SRLatentDiffusion(torch.nn.Module):
         save_iterations: bool = False,
         verbose: bool = False
     ):
-        """Obtain the super resolution of the given image.
+        """Obtain the super resolution from fused S2+S1 input.
 
         Args:
-            X (torch.Tensor): If a Sentinel-2 L2A image with reflectance values
-                in the range [0, 1] and shape CxWxH, the super resolution of the image
-                is returned. If a batch of images with shape BxCxWxH is given, a batch
-                of super resolved images is returned.
-            sampling_steps (int, optional): Number of steps to run the denoiser. Defaults
-                to 100.
-            temperature (float, optional): Temperature to use in the denoiser.
-                Defaults to 1.0. The higher the temperature, the more stochastic
-                the denoiser is (random noise gets multiplied by this).
-            spectral_correction (bool, optional): Apply spectral correction to the SR
-                image, using the LR image as reference. Defaults to True.
+            X_s2 (torch.Tensor): Sentinel-2 RGBNIR (B, 4, H, W) at LR resolution.
+            X_s1 (torch.Tensor): Sentinel-1 VV/VH (B, 2, H, W) at LR resolution.
+            sampling_steps (int, optional): Number of DDIM steps. Defaults to config.
+            sampling_eta (float, optional): DDIM eta (0=deterministic, 1=stochastic).
+            sampling_temperature (float, optional): Noise temperature. Defaults to config.
+            histogram_matching (bool, optional): Apply spectral correction. Defaults to True.
+            save_iterations (bool, optional): Return all intermediate SR images.
+            verbose (bool, optional): Show progress bar.
 
         Returns:
-            torch.Tensor: The super resolved image or batch of images with a shape of
-                Cx(Wx4)x(Hx4) or BxCx(Wx4)x(Hx4).
+            torch.Tensor: Super resolved aerial image (B, 4, HR_H, HR_W).
         """
         # fall back on config if args are None
         if sampling_eta is None:
@@ -146,51 +205,52 @@ class SRLatentDiffusion(torch.nn.Module):
             sampling_temperature = self.config.denoiser_settings.sampling_temperature
         if sampling_steps is None:
             sampling_steps = self.config.denoiser_settings.sampling_steps
-        
-        # Assert shape, size, dimensionality. Add padding if necessary
-        X,padding = assert_tensor_validity(X)
-        
-        # create no_data_mask
-        no_data_mask = create_no_data_mask(X, target_size= X.shape[-1]*4)
 
-        # Normalize the image
-        X = X.clone()
-        Xnorm = self._tensor_encode(X)
-        
-        # ddim, latent and time_range
+        # Assert shape, size, dimensionality. Add padding if necessary
+        X_s2, padding = assert_tensor_validity(X_s2)
+        X_s1, _ = assert_tensor_validity(X_s1)
+
+        # create no_data_mask from S2 (primary optical input)
+        no_data_mask = create_no_data_mask(X_s2, target_size=X_s2.shape[-1] * self.scale_factor)
+
+        # Encode S2+S1 into fused conditioning in latent space
+        conditioning = self._tensor_encode(X_s2.clone(), X_s1.clone())
+
+        # ddim, latent (4ch noise) and time_range
         ddim, latent, time_range = self._prepare_model(
-            X=Xnorm, eta=sampling_eta, custom_steps=sampling_steps, verbose=verbose
+            conditioning=conditioning, eta=sampling_eta,
+            custom_steps=sampling_steps, verbose=verbose
         )
-        iterator = tqdm(time_range, desc="DDIM Sampler", total=sampling_steps,disable=True)
+        iterator = tqdm(time_range, desc="DDIM Sampler", total=sampling_steps, disable=True)
 
         # Iterate over the timesteps
         if save_iterations:
             save_iters = []
-            
+
         for i, step in enumerate(iterator):
             outs = ddim.p_sample_ddim(
                 x=latent,
-                c=Xnorm,
+                c=conditioning,
                 t=step,
                 index=sampling_steps - i - 1,
                 use_original_steps=False,
                 temperature=sampling_temperature
             )
             latent, _ = outs
-            
+
             if save_iterations:
                 save_iters.append(
                     self._tensor_decode(latent, spe_cor=histogram_matching)
                 )
-        
+
         if save_iterations:
             return save_iters
-        
+
         sr = self._tensor_decode(latent, spe_cor=histogram_matching) # decode the latent image
-        
+
         # Post-processing
         sr = apply_no_data_mask(sr, no_data_mask) # apply no data mask as in LR image
-        sr = revert_padding(sr,padding) # remove padding from the SR image if there was any
+        sr = revert_padding(sr, padding) # remove padding from the SR image if there was any
         return sr
 
 
@@ -201,8 +261,8 @@ class SRLatentDiffusion(torch.nn.Module):
         Applies histogram matching to align the color distribution of image1 to image2.
 
         This function adjusts the pixel intensity distribution of `image1` (typically the
-        low-resolution or degraded image) to match that of `image2` (typically the 
-        high-resolution or reference image). The operation is done per channel and 
+        low-resolution or degraded image) to match that of `image2` (typically the
+        high-resolution or reference image). The operation is done per channel and
         assumes both images are in (C, H, W) format.
 
         Args:
@@ -210,7 +270,7 @@ class SRLatentDiffusion(torch.nn.Module):
             image2 (torch.Tensor): The reference image whose histogram will be matched (C, H, W).
 
         Returns:
-            torch.Tensor: A new tensor with the same shape as `image1`, but with pixel 
+            torch.Tensor: A new tensor with the same shape as `image1`, but with pixel
                         intensities adjusted to match the histogram of `image2`.
 
         Raises:
@@ -237,14 +297,14 @@ class SRLatentDiffusion(torch.nn.Module):
         """
         Loads pretrained model weights from a local file or downloads them from Hugging Face if not present.
 
-        If the specified `weights_file` does not exist locally, it is automatically downloaded from the 
+        If the specified `weights_file` does not exist locally, it is automatically downloaded from the
         Hugging Face model hub under `simon-donike/RS-SR-LTDF`. A progress bar is shown during download.
 
-        After loading, the method removes any perceptual loss-related weights from the state dict and 
+        After loading, the method removes any perceptual loss-related weights from the state dict and
         loads the remaining weights into the model.
 
         Args:
-            weights_file (str): Path to the local weights file. If the file is not found, it will be downloaded 
+            weights_file (str): Path to the local weights file. If the file is not found, it will be downloaded
                                 using this name from the Hugging Face repository.
 
         Raises:
@@ -255,16 +315,16 @@ class SRLatentDiffusion(torch.nn.Module):
         """
 
         # download pretrained model
-        # create download link based on input 
+        # create download link based on input
         hf_model = str("https://huggingface.co/simon-donike/RS-SR-LTDF/resolve/main/"+str(weights_file))
-        
+
         # Total size in bytes.
         if not pathlib.Path(weights_file).exists():
             print("Downloading pretrained weights from: ", hf_model)
             response = requests.get(hf_model, stream=True)
             total_size = int(response.headers.get('content-length', 0))
             block_size = 1024  # 1 Kibibyte
-            
+
             # Open the file to write as binary - write bytes to a file
             with open(weights_file, "wb") as f:
                 # Setup the progress bar
@@ -282,8 +342,8 @@ class SRLatentDiffusion(torch.nn.Module):
 
         self.model.load_state_dict(weights, strict=True)
         print("Loaded pretrained weights from: ", weights_file)
-        
-        
+
+
     def uncertainty_map(self, x, n_variations=15, sampling_steps=100):
         """
         Estimates uncertainty maps for each sample in the input batch using repeated stochastic forward passes.
@@ -301,8 +361,8 @@ class SRLatentDiffusion(torch.nn.Module):
             torch.Tensor: Uncertainty maps of shape (B, 1, H, W), where each value indicates pixel-wise uncertainty.
         """
         assert n_variations>3, "n_variations must be greater than 3 to compute uncertainty."
-        
-        
+
+
         batch_size = x.shape[0]
         rand_seed_list = random.sample(range(1, 9999), n_variations)
 
@@ -329,15 +389,15 @@ class SRLatentDiffusion(torch.nn.Module):
 
         result = torch.stack(all_variations)  # (B, 1, H, W)
         return result
-    
-    
+
+
 
     def _attribution_methods(
         self,
         X: torch.Tensor,
         grads: torch.Tensor,
         attribution_method: Literal[
-            "grad_x_input", "max_grad", "mean_grad", "min_grad"            
+            "grad_x_input", "max_grad", "mean_grad", "min_grad"
                         ],
                     ):
         """
@@ -355,7 +415,7 @@ class SRLatentDiffusion(torch.nn.Module):
             raise ValueError(
                 "The attribution method must be one of: grad_x_input, max_grad, mean_grad, min_grad"
             )
-    
+
     def explainer(
         self,
         X: torch.Tensor,
@@ -366,34 +426,34 @@ class SRLatentDiffusion(torch.nn.Module):
         steps_to_consider_for_attributions: list = list(range(100)),
         attribution_method: Literal[
             "grad_x_input", "max_grad", "mean_grad", "min_grad"
-        ] = "grad_x_input",      
+        ] = "grad_x_input",
         verbose: bool = False,
         enable_checkpoint = True,
-        histogram_matching=True        
-            ):  
+        histogram_matching=True
+            ):
         """
         DEPRECIATED; SUBJECT TO REMOVAL
         """
         # Normalize and encode the LR image
         X = X.clone()
         Xnorm = self._tensor_encode(X)
-        
+
         # ddim, latent and time_range
         ddim, latent, time_range = self._prepare_model(
             X=Xnorm, eta=eta, custom_steps=custom_steps, verbose=verbose
         )
-                    
+
         # Iterate over the timesteps
         container = []
         iterator = tqdm(time_range, desc="DDIM Sampler", total=custom_steps,disable=True)
         for i, step in enumerate(iterator):
-            
+
             # Activate or deactivate gradient tracking
             if i in steps_to_consider_for_attributions:
                 torch.set_grad_enabled(True)
             else:
                 torch.set_grad_enabled(False)
-            
+
             # Compute the latent image
             if enable_checkpoint:
                 outs = checkpoint.checkpoint(
@@ -405,7 +465,7 @@ class SRLatentDiffusion(torch.nn.Module):
                     temperature,
                     use_reentrant=False,
                 )
-            else:                
+            else:
                 outs = ddim.p_sample_ddim(
                     x=latent,
                     c=Xnorm,
@@ -414,17 +474,17 @@ class SRLatentDiffusion(torch.nn.Module):
                     temperature=temperature
                 )
             latent, _ = outs
-            
-            
+
+
             if i not in steps_to_consider_for_attributions:
                 continue
-            
+
             # Apply the mask
             output_graph = (latent*mask).mean()
-            
+
             # Compute the gradients
             grads = torch.autograd.grad(output_graph, Xnorm, retain_graph=True)[0]
-            
+
             # Compute the attribution and save it
             with torch.no_grad():
                 to_save = {
@@ -434,7 +494,7 @@ class SRLatentDiffusion(torch.nn.Module):
                     )
                 }
             container.append(to_save)
-        
+
         return container
 
 
@@ -463,7 +523,7 @@ class SRLatentDiffusionLightning(LightningModule):
     def forward(self, x,**kwargs):
         #print("Dont call 'forward' on the PL model, instead use 'predict'")
         return self.model(x)
-    
+
     def load_pretrained(self, weights_file: str):
         self.model.load_pretrained(weights_file)
         print("PL Model: Model loaded from ", weights_file)
@@ -474,7 +534,7 @@ class SRLatentDiffusionLightning(LightningModule):
         assert self.model.training == False, "Model in Training mode. Abort." # make sure we're in eval
         p = self.model.forward(x)
         return(p)
-    
+
     @torch.no_grad()
     def uncertainty_map(self, x,n_variations=15,custom_steps=100):
         uncertainty_map = self.model.uncertainty_map(x,n_variations,custom_steps)

@@ -9,6 +9,7 @@
 apply_normalization: False
 ckpt_version: "opensr-ldsrs2_v1_0_0.ckpt"
 encode_conditioning: True
+scale_factor: 2
 
 # Diffusion and Sampling Settings
 denoiser_settings:
@@ -37,7 +38,7 @@ first_stage_config:
 # Denoising UNet Settings
 cond_stage_config:
   image_size: 128
-  in_channels: 8
+  in_channels: 10
   model_channels: 160
   out_channels: 4
   num_res_blocks: 2
