@@ -14,7 +14,7 @@ scale_factor: 2
 # Diffusion and Sampling Settings
 denoiser_settings:
   linear_start: 0.0001 # noise start
-  linear_end: 0.0155 # noise end
+  linear_end: 0.01 # noise end
   timesteps: 1000 # Timesteps model was trained on - always 1k
   parameterization: "eps" # ["eps" or "x0"]
   sampling_eta: 0.95 # 0. to 1. -> 1 is more deterministic

@@ -5,6 +5,7 @@ import torch
 from opensr_model.autoencoder.utils import (Downsample, Normalize, ResnetBlock,
                                             Upsample, make_attn, nonlinearity)
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class Encoder(nn.Module):
@@ -143,7 +144,7 @@ class Encoder(nn.Module):
         # Downsampling through the layers
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](hs[-1], temb)
+                h = checkpoint(self.down[i_level].block[i_block], hs[-1], temb, use_reentrant=False)
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_block](h)
                 hs.append(h)
@@ -152,9 +153,9 @@ class Encoder(nn.Module):
 
         # Middle processing with blocks and attention
         h = hs[-1]
-        h = self.mid.block_1(h, temb)
+        h = checkpoint(self.mid.block_1, h, temb, use_reentrant=False)
         h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = checkpoint(self.mid.block_2, h, temb, use_reentrant=False)
 
         # Final transformation to produce the output
         h = self.norm_out(h)
@@ -322,14 +323,14 @@ class Decoder(nn.Module):
         h = self.conv_in(z)
 
         # Middle processing blocks
-        h = self.mid.block_1(h, temb)
+        h = checkpoint(self.mid.block_1, h, temb, use_reentrant=False)
         h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = checkpoint(self.mid.block_2, h, temb, use_reentrant=False)
 
         # Upsampling steps
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
-                h = self.up[i_level].block[i_block](h, temb)
+                h = checkpoint(self.up[i_level].block[i_block], h, temb, use_reentrant=False)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:

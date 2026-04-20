@@ -41,9 +41,9 @@ def normalize_s2(t_input, stage="norm"):
         squeeze = True
 
     if stage == "norm":
-        t[:, 0] = t[:, 0] / RGB_DIVISOR   # B02 (Blue)
+        t[:, 0] = t[:, 0] / RGB_DIVISOR   # B04 (Red)
         t[:, 1] = t[:, 1] / RGB_DIVISOR   # B03 (Green)
-        t[:, 2] = t[:, 2] / RGB_DIVISOR   # B04 (Red)
+        t[:, 2] = t[:, 2] / RGB_DIVISOR   # B02 (Blue)
         t[:, 3] = t[:, 3] / NIR_DIVISOR   # B08 (NIR)
         t = t.clamp(0, 1)
         t = t * 2 - 1                      # [0,1] → [-1,1]

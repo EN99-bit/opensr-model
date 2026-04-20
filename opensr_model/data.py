@@ -54,7 +54,7 @@ class FusionDataset(Dataset):
 
     # Expected per-band keys in the NPZ files
     S1_KEYS = ["s1_vv", "s1_vh"]
-    S2_KEYS = ["s2_b", "s2_g", "s2_r", "s2_nir"]
+    S2_KEYS = ["s2_r", "s2_g", "s2_b", "s2_nir"]
     AERIAL_KEYS = ["aerial_r", "aerial_g", "aerial_b", "aerial_nir"]
 
     def __init__(

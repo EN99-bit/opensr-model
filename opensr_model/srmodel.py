@@ -39,6 +39,7 @@ class SRLatentDiffusion(torch.nn.Module):
             cond_stage_trainable=config.other.cond_stage_trainable,
             first_stage_key=config.other.first_stage_key,
             cond_stage_key=config.other.cond_stage_key,
+            scale_factor=0.18215, # 512/2800, adjust if you change the target HR size or VAE downscale
         )
 
 
@@ -129,19 +130,39 @@ class SRLatentDiffusion(torch.nn.Module):
         conditioning = conditioning.to(self.device)
         return conditioning
 
-    def _tensor_decode(self, X_enc: torch.Tensor, spe_cor: bool = True):       
-        # Decode VAE latent → aerial image
-        X_dec = self.model.decode_first_stage(X_enc)
-        # Denormalize aerial output: [-1,1] → [0,255]
-        X_dec = normalize_aerial(X_dec, stage="denorm")
-        # Apply spectral correction using stored S2 LR reference
+
+
+    def _tensor_decode(self, latent: torch.Tensor, spe_cor: bool = False) -> torch.Tensor:
+        """Decode a latent tensor back to aerial image space.
+
+        Args:
+            latent: (B, 4, latent_H, latent_W) latent tensor from DDIM sampling.
+            spe_cor: If True, apply histogram matching against the stored S2 input.
+
+        Returns:
+            (B, 4, HR_H, HR_W) aerial image in [0, 255] range.
+        """
+        # Decode latent → [-1, 1] image space via VAE decoder
+        decoded = self.model.decode_first_stage(latent)
+
+        # Denormalize [-1, 1] → [0, 255]
+        sr = normalize_aerial(decoded, stage="denorm")
+
+        # Spectral correction: histogram match SR to S2 input per sample
         if spe_cor and self._X_s2 is not None:
-            n_match = min(X_dec.shape[1], self._X_s2.shape[1])
-            for i in range(n_match):
-                X_dec[:, i] = self.hq_histogram_matching(X_dec[:, i], self._X_s2[:, i])
-        # If the value is negative, set it to 0
-        X_dec[X_dec < 0] = 0    
-        return X_dec
+            # Upsample S2 to SR spatial size for reference
+            s2_up = torch.nn.functional.interpolate(
+                self._X_s2.to(sr.device),
+                size=sr.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            corrected = []
+            for i in range(sr.shape[0]):
+                corrected.append(self.hq_histogram_matching(sr[i], s2_up[i]))
+            sr = torch.stack(corrected)
+
+        return sr
 
     def _prepare_model(
         self,
@@ -171,6 +192,18 @@ class SRLatentDiffusion(torch.nn.Module):
 
         return ddim, latent, time_range
 
+    def _ddim_step(self, latent, e_t, index, ddim, temperature):
+        """Single DDIM update step given a pre-computed noise prediction e_t."""
+        B, device = latent.shape[0], latent.device
+        a_t     = torch.full((B, 1, 1, 1), ddim.ddim_alphas[index],              device=device)
+        a_prev  = torch.full((B, 1, 1, 1), ddim.ddim_alphas_prev[index],         device=device)
+        sigma_t = torch.full((B, 1, 1, 1), ddim.ddim_sigmas[index],              device=device)
+        sqrt_one_minus_at = torch.full((B, 1, 1, 1), ddim.ddim_sqrt_one_minus_alphas[index], device=device)
+        pred_x0 = (latent - sqrt_one_minus_at * e_t) / a_t.sqrt()
+        dir_xt  = (1.0 - a_prev - sigma_t ** 2).sqrt() * e_t
+        noise   = sigma_t * torch.randn_like(latent) * temperature
+        return a_prev.sqrt() * pred_x0 + dir_xt + noise
+
     @torch.no_grad()
     def forward(
         self,
@@ -181,7 +214,8 @@ class SRLatentDiffusion(torch.nn.Module):
         sampling_temperature: float = None,
         histogram_matching: bool = True,
         save_iterations: bool = False,
-        verbose: bool = False
+        verbose: bool = False,
+        guidance_scale: float = 1.0,
     ):
         """Obtain the super resolution from fused S2+S1 input.
 
@@ -215,6 +249,7 @@ class SRLatentDiffusion(torch.nn.Module):
 
         # Encode S2+S1 into fused conditioning in latent space
         conditioning = self._tensor_encode(X_s2.clone(), X_s1.clone())
+        null_conditioning = torch.zeros_like(conditioning)  # used for CFG
 
         # ddim, latent (4ch noise) and time_range
         ddim, latent, time_range = self._prepare_model(
@@ -228,15 +263,21 @@ class SRLatentDiffusion(torch.nn.Module):
             save_iters = []
 
         for i, step in enumerate(iterator):
-            outs = ddim.p_sample_ddim(
-                x=latent,
-                c=conditioning,
-                t=step,
-                index=sampling_steps - i - 1,
-                use_original_steps=False,
-                temperature=sampling_temperature
-            )
-            latent, _ = outs
+            index = sampling_steps - i - 1
+            t = torch.full((latent.shape[0],), step, device=conditioning.device, dtype=torch.long)
+
+            if guidance_scale > 1.0:
+                # CFG: two UNet passes, amplify conditioned direction
+                e_t_uncond = self.model.apply_model(latent, t, cond=null_conditioning)
+                e_t_cond   = self.model.apply_model(latent, t, cond=conditioning)
+                e_t = e_t_uncond + guidance_scale * (e_t_cond - e_t_uncond)
+                latent = self._ddim_step(latent, e_t, index, ddim, sampling_temperature)
+            else:
+                outs = ddim.p_sample_ddim(
+                    x=latent, c=conditioning, t=step, index=index,
+                    use_original_steps=False, temperature=sampling_temperature,
+                )
+                latent, _ = outs
 
             if save_iterations:
                 save_iters.append(
@@ -539,4 +580,3 @@ class SRLatentDiffusionLightning(LightningModule):
     def uncertainty_map(self, x,n_variations=15,custom_steps=100):
         uncertainty_map = self.model.uncertainty_map(x,n_variations,custom_steps)
         return(uncertainty_map)
-

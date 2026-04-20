@@ -39,7 +39,7 @@ Image.fromarray(aerial_rgb).save(TEST_DIR / "output_test_1_aerial_gt.png")
 print("Saved output_test_1_aerial_gt.png")
 
 # 6. Save S2 input RGB preview
-s2_rgb = s2[0, [2, 1, 0]]  # R, G, B order
+s2_rgb = s2[0, :3]
 s2_rgb = (s2_rgb / s2_rgb.max() * 255).clamp(0, 255).byte().cpu().numpy().transpose(1, 2, 0)
 Image.fromarray(s2_rgb).save(TEST_DIR / "output_test_1_s2_input.png")
 print("Saved output_test_1_s2_input.png")

@@ -24,11 +24,14 @@ import sys
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.tuner import Tuner
 
 # Add project root to path so opensr_model is importable
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -49,12 +52,15 @@ class LitUNetDenoiser(pl.LightningModule):
     Conditioning is built on-the-fly from S1+S2 inputs.
     """
 
-    def __init__(self, config, vae_ckpt: str = None, lr: float = 1e-4, max_epochs: int = 100):
+    def __init__(self, config, vae_ckpt: str = None, lr: float = 1e-4, max_epochs: int = 100, warmup_epochs: int = 5, cfg_dropout: float = 0.15, no_warmup: bool = False):
         super().__init__()
         self.save_hyperparameters(ignore=["config"])
         self.config = config
         self.lr = lr
         self.max_epochs = max_epochs
+        self.warmup_epochs = warmup_epochs
+        self.cfg_dropout = cfg_dropout
+        self.no_warmup = no_warmup
 
         # Derived sizes from config
         self.scale_factor = config.scale_factor
@@ -74,6 +80,7 @@ class LitUNetDenoiser(pl.LightningModule):
             linear_start=config.denoiser_settings.linear_start,
             linear_end=config.denoiser_settings.linear_end,
             parameterization=config.denoiser_settings.parameterization,
+            scale_factor=0.18215
         )
 
         # Load pretrained VAE weights
@@ -100,9 +107,16 @@ class LitUNetDenoiser(pl.LightningModule):
         state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
-        cleaned = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        self.ldm.first_stage_model.load_state_dict(cleaned, strict=False)
-        print(f"  VAE loaded ({len(cleaned)} keys)")
+        cleaned = {}
+        for k, v in state_dict.items():
+            k = k.replace("module.", "")
+            if k.startswith("disc.") or k.startswith("lpips_fn."):
+                continue
+            if k.startswith("vae."):
+                k = k[4:]
+            cleaned[k] = v
+        missing, unexpected = self.ldm.first_stage_model.load_state_dict(cleaned, strict=True)
+        print(f"  VAE loaded: {len(cleaned)} keys (missing: {len(missing)}, unexpected: {len(unexpected)})")
 
     # ── Encoding helpers ─────────────────────────────────────────────────────
 
@@ -115,8 +129,9 @@ class LitUNetDenoiser(pl.LightningModule):
         # S2 → normalize → upsample to HR → VAE encode → 4ch latent
         s2_norm = normalize_s2(s2, stage="norm")
         s2_up = F.interpolate(s2_norm, size=(hr_size, hr_size), mode="bilinear", align_corners=False)
-        with torch.no_grad():
-            cond_s2 = self.ldm.first_stage_model.encode(s2_up).sample()
+        vae_dtype = next(self.ldm.first_stage_model.parameters()).dtype
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+            cond_s2 = self.ldm.first_stage_model.encode(s2_up.to(vae_dtype)).sample()
 
         # S1 → normalize → upsample to latent size → 2ch
         s1_norm = normalize_s1(s1, stage="norm")
@@ -127,8 +142,9 @@ class LitUNetDenoiser(pl.LightningModule):
     def _encode_aerial(self, aerial):
         """Encode aerial HR image → VAE latent z_0."""
         aerial_norm = normalize_aerial(aerial, stage="norm")
-        with torch.no_grad():
-            posterior = self.ldm.encode_first_stage(aerial_norm)
+        vae_dtype = next(self.ldm.first_stage_model.parameters()).dtype
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+            posterior = self.ldm.encode_first_stage(aerial_norm.to(vae_dtype))
             z_0 = self.ldm.get_first_stage_encoding(posterior)
         return z_0
 
@@ -146,8 +162,11 @@ class LitUNetDenoiser(pl.LightningModule):
         # 1. Encode aerial → z_0
         z_0 = self._encode_aerial(aerial)
 
-        # 2. Build conditioning from S1+S2
+        # 2. Build conditioning from S1+S2 (drop to zeros with cfg_dropout probability)
         conditioning = self._build_conditioning(s2, s1)
+        if self.cfg_dropout > 0 and self.training:
+            mask = (torch.rand(conditioning.shape[0], 1, 1, 1, device=conditioning.device) > self.cfg_dropout)
+            conditioning = conditioning * mask
 
         # 3. Sample timestep and noise
         B = z_0.shape[0]
@@ -176,14 +195,56 @@ class LitUNetDenoiser(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        # Only optimize UNet parameters
         optimizer = torch.optim.AdamW(self.ldm.model.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.max_epochs)
+        if self.no_warmup:
+            scheduler = CosineAnnealingLR(optimizer, T_max=self.max_epochs)
+        else:
+            warmup = LinearLR(optimizer, start_factor=1.0 / self.warmup_epochs, total_iters=self.warmup_epochs)
+            cosine = CosineAnnealingLR(optimizer, T_max=self.max_epochs - self.warmup_epochs)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[self.warmup_epochs])
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
     def on_train_epoch_start(self):
         # Ensure VAE stays frozen and in eval mode
         self.ldm.first_stage_model.eval()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Augmentation wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AugmentedDataset(Dataset):
+    """Wraps a FusionDataset split and applies random flips + 90° rotations.
+
+    The same transform is applied identically to s1, s2, and aerial so that
+    spatial alignment is preserved. Only used for the training split.
+    """
+
+    def __init__(self, base_dataset):
+        self.base = base_dataset
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        sample = self.base[idx]
+        s1, s2, aerial = sample["s1"], sample["s2"], sample["aerial"]
+
+        if torch.rand(1).item() > 0.5:  # horizontal flip
+            s1 = torch.flip(s1, dims=[-1])
+            s2 = torch.flip(s2, dims=[-1])
+            aerial = torch.flip(aerial, dims=[-1])
+        if torch.rand(1).item() > 0.5:  # vertical flip
+            s1 = torch.flip(s1, dims=[-2])
+            s2 = torch.flip(s2, dims=[-2])
+            aerial = torch.flip(aerial, dims=[-2])
+        k = torch.randint(0, 4, (1,)).item()  # 90° rotation: 0, 90, 180, 270
+        if k > 0:
+            s1 = torch.rot90(s1, k, dims=[-2, -1])
+            s2 = torch.rot90(s2, k, dims=[-2, -1])
+            aerial = torch.rot90(aerial, k, dims=[-2, -1])
+
+        return {**sample, "s1": s1, "s2": s2, "aerial": aerial}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -199,7 +260,7 @@ class FusionDataModule(pl.LightningDataModule):
 
     def __init__(self, data_dir: str, batch_size: int = 2, num_workers: int = 4,
                  train_frac: float = 0.8, val_frac: float = 0.1, test_frac: float = 0.1,
-                 seed: int = 42):
+                 seed: int = 42, augment: bool = False):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -208,6 +269,7 @@ class FusionDataModule(pl.LightningDataModule):
         self.val_frac = val_frac
         self.test_frac = test_frac
         self.seed = seed
+        self.augment = augment
         self.train_ds = None
         self.val_ds = None
         self.test_ds = None
@@ -220,6 +282,8 @@ class FusionDataModule(pl.LightningDataModule):
                 [self.train_frac, self.val_frac, self.test_frac],
                 generator=torch.Generator().manual_seed(self.seed),
             )
+            if self.augment:
+                self.train_ds = AugmentedDataset(self.train_ds)
             print(f"[Split] Train: {len(self.train_ds)}, Val: {len(self.val_ds)}, Test: {len(self.test_ds)}")
 
     def train_dataloader(self):
@@ -253,12 +317,18 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Epochs to linearly ramp LR from 0 to --lr")
+    parser.add_argument("--no_warmup", action="store_true", default=False, help="Disable LR warmup, use plain CosineAnnealingLR")
+    parser.add_argument("--cfg_dropout", type=float, default=0.15, help="Probability of dropping conditioning during training for CFG (0 = disabled)")
+    parser.add_argument("--augment", action="store_true", default=False, help="Enable random flip+rotation augmentation on training set")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--val_frac", type=float, default=0.1)
     parser.add_argument("--test_frac", type=float, default=0.1)
     parser.add_argument("--precision", type=str, default="32", help="Training precision: 32, 16-mixed, bf16-mixed")
-    parser.add_argument("--devices", type=int, default=1, help="Number of GPUs (0 = CPU)")
+    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs). 0 = disabled.")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument("--find_lr", action="store_true", default=False, help="Run LR range test and save plot, then exit")
     parser.add_argument("--log_dir", type=str, default="lightning_logs", help="TensorBoard log directory")
     args = parser.parse_args()
 
@@ -271,11 +341,11 @@ def main():
     print(f"Config: {config_path}")
 
     # ── Model + Data ────────────────────────────────────────────────────────
-    model = LitUNetDenoiser(config, vae_ckpt=args.vae_ckpt, lr=args.lr, max_epochs=args.epochs)
+    model = LitUNetDenoiser(config, vae_ckpt=args.vae_ckpt, lr=args.lr, max_epochs=args.epochs, warmup_epochs=args.warmup_epochs, cfg_dropout=args.cfg_dropout, no_warmup=args.no_warmup)
     dm = FusionDataModule(args.data_dir, batch_size=args.batch_size,
                           num_workers=args.num_workers,
                           train_frac=args.train_frac, val_frac=args.val_frac,
-                          test_frac=args.test_frac)
+                          test_frac=args.test_frac, augment=args.augment)
 
     # ── Callbacks ───────────────────────────────────────────────────────────
     callbacks = [
@@ -289,16 +359,20 @@ def main():
         ),
         LearningRateMonitor(logging_interval="epoch"),
     ]
+    if args.patience > 0:
+        callbacks.append(EarlyStopping(monitor="val_loss", patience=args.patience, mode="min", verbose=True))
 
     # ── Logger ──────────────────────────────────────────────────────────────
     logger = TensorBoardLogger(save_dir=args.log_dir, name="unet_s1s2_fusion")
 
     # ── Trainer ─────────────────────────────────────────────────────────────
-    accelerator = "gpu" if args.devices > 0 and torch.cuda.is_available() else "cpu"
+    num_gpus = torch.cuda.device_count()
+    accelerator = "gpu" if num_gpus > 0 else "cpu"
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator=accelerator,
-        devices=args.devices if accelerator == "gpu" else "auto",
+        devices=num_gpus if accelerator == "gpu" else "auto",
+        strategy=DDPStrategy(find_unused_parameters=False) if num_gpus > 1 else "auto",
         precision=args.precision,
         callbacks=callbacks,
         logger=logger,
@@ -306,8 +380,20 @@ def main():
         gradient_clip_val=1.0,
     )
 
+    # ── LR range test ───────────────────────────────────────────────────────
+    if args.find_lr:
+        tuner = Tuner(trainer)
+        lr_finder = tuner.lr_find(model, dm, min_lr=1e-7, max_lr=1, num_training=200)
+        suggested_lr = lr_finder.suggestion()
+        print(f"\nSuggested LR: {suggested_lr:.2e}")
+        fig = lr_finder.plot(suggest=True)
+        out_path = "lr_finder.png"
+        fig.savefig(out_path)
+        print(f"LR finder plot saved to: {out_path}")
+        return
+
     # ── Train ───────────────────────────────────────────────────────────────
-    trainer.fit(model, dm)
+    trainer.fit(model, dm, ckpt_path=args.resume)
 
 
 if __name__ == "__main__":

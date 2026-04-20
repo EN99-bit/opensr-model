@@ -1,9 +1,5 @@
-.idea/
 .vscode
 .vscode/*
-data/
-lightning_logs/
-checkpoints/
 *.swp
 other_uncertainty_2.py
 sr_of_s2_tile.py
@@ -15,8 +11,14 @@ client_secret.json
 *.DS_Store
 example_images/
 client_secret.json
+checkpoints/
+lightning_logs/
+resources/
 
-*.svg
+.idea/
+data/
+*.npz
+.github/
 old/
 old/*
 *.safetensors
@@ -32,6 +34,20 @@ images/*
 images_comparison
 images_comparison/*
 comp_s2_s2naip.py
+
+# Experiment artifacts (hosted on Hugging Face)
+mlruns/
+mlflow.db
+
+# Inference outputs & scratch images
+test/results/
+test/e*-val*/
+test/output_test_*.png
+test/inference_*.png
+test/unet-*/
+ae_check.png
+map.png
+billeder-til-esben/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

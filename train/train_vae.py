@@ -47,7 +47,8 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, random_split
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # Add project root to path so opensr_model is importable
@@ -79,9 +80,9 @@ def _rbf_kernel(x, y, bandwidths=(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)):
     rx = xx.diag().unsqueeze(0).expand_as(xx)
     ry = yy.diag().unsqueeze(0).expand_as(yy)
 
-    dxx = rx.t() + rx - 2.0 * xx
-    dyy = ry.t() + ry - 2.0 * yy
-    dxy = rx.t() + ry - 2.0 * xy
+    dxx = (rx.t() + rx - 2.0 * xx).clamp(min=0)
+    dyy = (ry.t() + ry - 2.0 * yy).clamp(min=0)
+    dxy = (rx.t() + ry - 2.0 * xy).clamp(min=0)
 
     K_xx, K_yy, K_xy = (
         torch.zeros_like(xx),
@@ -109,14 +110,18 @@ def mmd_loss(z, z_prior):
         Scalar MMD loss.
     """
     B = z.shape[0]
-    z_flat = z.reshape(B, -1)       # (B, C*H*W)
-    p_flat = z_prior.reshape(B, -1)
+    if B < 2:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+
+    # fp32 + clamp prevents fp16 Inf from causing NaN in dot products (Inf*0=NaN)
+    z_flat = z.float().reshape(B, -1).clamp(-1e4, 1e4)
+    p_flat = z_prior.float().reshape(B, -1)
 
     K_zz, K_pp, K_zp = _rbf_kernel(z_flat, p_flat)
 
     n = B
-    mmd = (K_zz.sum() / (n * (n - 1 + 1e-8))
-           + K_pp.sum() / (n * (n - 1 + 1e-8))
+    mmd = (K_zz.sum() / (n * (n - 1))
+           + K_pp.sum() / (n * (n - 1))
            - 2.0 * K_zp.sum() / (n * n))
     return mmd
 
@@ -461,8 +466,10 @@ def main():
     parser.add_argument("--test_frac", type=float, default=0.0)
     parser.add_argument("--precision", type=str, default="32",
                         help="Training precision: 32, 16-mixed, bf16-mixed")
-    parser.add_argument("--devices", type=int, default=1,
+    parser.add_argument("--devices", type=int, default=4,
                         help="Number of GPUs (0 = CPU)")
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Early stopping patience (epochs). 0 = disabled.")
     parser.add_argument("--log_dir", type=str, default="lightning_logs",
                         help="TensorBoard log directory")
     args = parser.parse_args()
@@ -502,6 +509,8 @@ def main():
         ),
         LearningRateMonitor(logging_interval="epoch"),
     ]
+    if args.patience > 0:
+        callbacks.append(EarlyStopping(monitor="val_loss", patience=args.patience, mode="min", verbose=True))
 
     # ── Logger ──────────────────────────────────────────────────────────────
     logger = TensorBoardLogger(save_dir=args.log_dir, name="vae_aerial")
@@ -512,6 +521,7 @@ def main():
         max_epochs=args.epochs,
         accelerator=accelerator,
         devices=args.devices if accelerator == "gpu" else "auto",
+        strategy=DDPStrategy(find_unused_parameters=True) if (accelerator == "gpu" and args.devices > 1) else "auto",
         precision=args.precision,
         callbacks=callbacks,
         logger=logger,
