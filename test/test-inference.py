@@ -24,7 +24,7 @@ from opensr_model.srmodel import SRLatentDiffusion
 from opensr_model.data import FusionDataset
 
 TEST_DIR = pathlib.Path(__file__).parent
-DEFAULT_UNET_CKPT = ROOT / "checkpoints" / "unet" / "last.ckpt"
+DEFAULT_UNET_CKPT = ROOT / "checkpoints" / "1m" / "unet" / "last.ckpt"
 
 
 def load_trained_weights(model: SRLatentDiffusion, unet_ckpt: str):

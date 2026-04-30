@@ -15,6 +15,7 @@ checkpoints/
 lightning_logs/
 resources/
 
+*.png
 .idea/
 data/
 *.npz

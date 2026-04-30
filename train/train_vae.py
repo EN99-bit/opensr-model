@@ -3,8 +3,8 @@
 Powered by PyTorch Lightning.
 
 This is the FIRST step in the Latent Diffusion SR pipeline.
-We train the VAE to compress 256x256 aerial RGBNIR images into
-64x64x4 latent representations and reconstruct them faithfully.
+We train the VAE to compress 1024x1024 aerial RGBNIR images into
+128x128x4 latent representations and reconstruct them faithfully.
 
 TRAINING OBJECTIVE (following LDSR-S2 paper, Eq. 1):
   L_total = λ_WD  · L_WD(z)
@@ -23,18 +23,19 @@ TRAINING OBJECTIVE (following LDSR-S2 paper, Eq. 1):
            (VGG expects 3ch input, paper Section IV-A).
 
 DATA:
-  NPZ tiles with aerial_r, aerial_g, aerial_b, aerial_nir (uint8, 200x200).
-  Zero-padded to 256x256 by FusionDataset.  Normalized to [-1,1].
+  NPZ tiles with aerial_r, aerial_g, aerial_b, aerial_nir (uint8, 1000x1000).
+  Zero-padded to 1024x1024 by FusionDataset.  Normalized to [-1,1].
 
 Usage:
     python train_vae.py --data_dir /path/to/npz_tiles
-    python train_vae.py --data_dir /path/to/npz_tiles --epochs 200 --batch_size 8 --precision 16-mixed
+    python train_vae.py --data_dir /path/to/npz_tiles --epochs 200 --batch_size 2 --precision 16-mixed
 
 After training, use the checkpoint for UNet training (Phase 2):
-    python train_unet.py --data_dir /path/to/npz_tiles --vae_ckpt checkpoints/vae/last.ckpt
+    python train_unet.py --data_dir /path/to/npz_tiles --vae_ckpt checkpoints/1m/vae/last.ckpt
 """
 
 import argparse
+import os
 import pathlib
 import random
 import sys
@@ -57,6 +58,85 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from opensr_model.autoencoder.autoencoder import AutoencoderKL
 from opensr_model.data import FusionDataset
 from opensr_model.utils import normalize_aerial
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# D4 augmentation wrapper (8 deterministic orientations per tile)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# The 8 elements of the dihedral group D4: (k rotations of 90°, flip)
+_D4 = [(k, flip) for k in range(4) for flip in (False, True)]
+
+
+def _apply_d4(tensor: torch.Tensor, k: int, flip: bool) -> torch.Tensor:
+    if k:
+        tensor = torch.rot90(tensor, k, dims=[-2, -1])
+    if flip:
+        tensor = torch.flip(tensor, dims=[-1])
+    return tensor
+
+
+class D4Dataset(torch.utils.data.Dataset):
+    """Expands a dataset 8× by returning all D4 orientations of each tile.
+
+    Index mapping: sample i → base tile i//8, transform i%8.
+    All spatial tensors (s1, s2, aerial) get the same transform so they stay aligned.
+    """
+
+    def __init__(self, base_ds):
+        self.base_ds = base_ds
+
+    def __len__(self):
+        return len(self.base_ds) * 8
+
+    def __getitem__(self, idx):
+        sample = self.base_ds[idx // 8]
+        k, flip = _D4[idx % 8]
+        if k or flip:
+            sample = {**sample,
+                      "s1":     _apply_d4(sample["s1"],     k, flip),
+                      "s2":     _apply_d4(sample["s2"],     k, flip),
+                      "aerial": _apply_d4(sample["aerial"], k, flip)}
+        return sample
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Random crop wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CroppedDataset(torch.utils.data.Dataset):
+    """Randomly crops aerial (and S1/S2 at matching location) to crop_size×crop_size.
+
+    S1/S2 are at a lower resolution than aerial (LR_PAD_SIZE vs HR_PAD_SIZE).
+    The crop location is scaled proportionally so all tensors stay geographically aligned.
+    crop_size must be divisible by the VAE downscale factor (e.g. 8 for ch_mult=[1,2,4,8]).
+    """
+
+    def __init__(self, base_ds, crop_size: int):
+        self.base_ds = base_ds
+        self.crop_size = crop_size
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx):
+        sample = self.base_ds[idx]
+        _, H, W = sample["aerial"].shape
+        top  = torch.randint(0, H - self.crop_size + 1, (1,)).item()
+        left = torch.randint(0, W - self.crop_size + 1, (1,)).item()
+
+        aerial = sample["aerial"][:, top:top + self.crop_size, left:left + self.crop_size]
+
+        # Scale crop window to LR resolution and crop S1/S2 consistently
+        lr_h = sample["s1"].shape[-2]
+        scale = lr_h / H
+        lr_top  = round(top  * scale)
+        lr_left = round(left * scale)
+        lr_crop = round(self.crop_size * scale)
+        s1 = sample["s1"][:, lr_top:lr_top + lr_crop, lr_left:lr_left + lr_crop]
+        s2 = sample["s2"][:, lr_top:lr_top + lr_crop, lr_left:lr_left + lr_crop]
+
+        return {**sample, "aerial": aerial, "s1": s1, "s2": s2}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -113,11 +193,14 @@ def mmd_loss(z, z_prior):
     if B < 2:
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
-    # fp32 + clamp prevents fp16 Inf from causing NaN in dot products (Inf*0=NaN)
-    z_flat = z.float().reshape(B, -1).clamp(-1e4, 1e4)
+    # nan_to_num handles fp16 NaN/Inf before kernel computation (clamp alone does not fix NaN)
+    z_flat = z.float().nan_to_num(0.0, posinf=1e4, neginf=-1e4).reshape(B, -1)
     p_flat = z_prior.float().reshape(B, -1)
 
-    K_zz, K_pp, K_zp = _rbf_kernel(z_flat, p_flat)
+    # Disable autocast: matmul is autocast-eligible, so fp32 z_flat would be
+    # cast to fp16, causing dot products (4096 × (1e4)²) to overflow → NaN.
+    with torch.autocast(device_type="cuda", enabled=False):
+        K_zz, K_pp, K_zp = _rbf_kernel(z_flat, p_flat)
 
     n = B
     mmd = (K_zz.sum() / (n * (n - 1))
@@ -249,15 +332,20 @@ class LitVAE(pl.LightningModule):
         training step to calculate LPIPS.
         """
         idx = sorted(random.sample(range(4), 3))
-        return self.lpips_fn(reconstruction[:, idx], target[:, idx]).mean()
+        # Disable autocast: Conv2d is autocast-eligible, so VGG runs in fp16 even
+        # with fp32 inputs. With reconstruction values up to ±10, VGG activations
+        # can overflow fp16 → NaN. Force fp32 for the entire VGG forward pass.
+        with torch.autocast(device_type="cuda", enabled=False):
+            return self.lpips_fn(reconstruction[:, idx].float(), target[:, idx].float()).mean()
 
     def _vae_loss(self, batch):
         """Full VAE loss: WD + MAE + GAN(generator) + LPIPS."""
-        aerial = batch["aerial"]  # (B, 4, 256, 256) float32 [0, 255]
+        aerial = batch["aerial"]  # (B, 4, H, W) float32 [0, 255]
         x = normalize_aerial(aerial, stage="norm")  # -> [-1, 1]
 
         # Forward through VAE
         reconstruction, posterior = self.vae(x, sample_posterior=True)
+        reconstruction = reconstruction.float().nan_to_num(0.0).clamp(-10, 10).to(x.dtype)
         z = posterior.sample()
 
         # ── Wasserstein Distance (MMD) ───────────────────────────────────
@@ -291,6 +379,11 @@ class LitVAE(pl.LightningModule):
             "gan_g": gan_g_loss,
             "lpips": lpips_loss,
         }
+        if not torch.isfinite(total) and self.global_rank == 0:
+            print(f"[NaN] wd={wd_loss.item():.4f} mae={mae_loss.item():.4f} "
+                  f"lpips={lpips_loss.item():.4f} "
+                  f"recon_max={reconstruction.abs().max().item():.2f} "
+                  f"x_max={x.abs().max().item():.2f}")
         return losses, reconstruction, x
 
     def _disc_loss(self, reconstruction, target):
@@ -322,12 +415,12 @@ class LitVAE(pl.LightningModule):
             d_loss = torch.tensor(0.0, device=self.device)
 
         # ── Logging ──────────────────────────────────────────────────────
-        self.log("train_loss", losses["total"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_wd", losses["wd"], on_step=False, on_epoch=True)
-        self.log("train_mae", losses["mae"], on_step=False, on_epoch=True)
-        self.log("train_gan_g", losses["gan_g"], on_step=False, on_epoch=True)
-        self.log("train_lpips", losses["lpips"], on_step=False, on_epoch=True)
-        self.log("train_disc", d_loss, on_step=False, on_epoch=True)
+        self.log("train_loss", losses["total"], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train_wd", losses["wd"], on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_mae", losses["mae"], on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_gan_g", losses["gan_g"], on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_lpips", losses["lpips"], on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_disc", d_loss, on_step=False, on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
         losses, _, _ = self._vae_loss(batch)
@@ -352,13 +445,6 @@ class LitVAE(pl.LightningModule):
             {"optimizer": opt_disc, "lr_scheduler": {"scheduler": sch_disc, "interval": "epoch"}},
         )
 
-    def lr_schedulers(self):
-        # Ensure both schedulers are stepped each epoch
-        scheds = super().lr_schedulers()
-        if not isinstance(scheds, (list, tuple)):
-            scheds = [scheds]
-        return scheds
-
     def on_train_epoch_end(self):
         # Step LR schedulers manually (required with manual optimization)
         scheds = self.lr_schedulers()
@@ -375,12 +461,13 @@ class AerialDataModule(pl.LightningDataModule):
     """DataModule that loads NPZ tiles for VAE training (only aerial bands used).
 
     Uses the same FusionDataset as train_unet.py and the same deterministic
-    random_split strategy (80/10/10 by default, seed=42).
+    random_split strategy (95/5 by default, seed=42).
     """
 
     def __init__(self, data_dir: str, batch_size: int = 4, num_workers: int = 4,
                  train_frac: float = 0.95, val_frac: float = 0.05,
-                 test_frac: float = 0.0, seed: int = 42):
+                 test_frac: float = 0.0, seed: int = 42, augment: bool = False,
+                 crop_size: "int | None" = None):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -389,6 +476,8 @@ class AerialDataModule(pl.LightningDataModule):
         self.val_frac = val_frac
         self.test_frac = test_frac
         self.seed = seed
+        self.augment = augment
+        self.crop_size = crop_size
         self.train_ds = None
         self.val_ds = None
         self.test_ds = None
@@ -409,8 +498,14 @@ class AerialDataModule(pl.LightningDataModule):
                     generator=torch.Generator().manual_seed(self.seed),
                 )
                 self.test_ds = []
-            print(f"[Split] Train: {len(self.train_ds)}, "
-                  f"Val: {len(self.val_ds)}, Test: {len(self.test_ds)}")
+            if self.crop_size:
+                self.train_ds = CroppedDataset(self.train_ds, self.crop_size)
+                self.val_ds = CroppedDataset(self.val_ds, self.crop_size)
+            if self.augment:
+                self.train_ds = D4Dataset(self.train_ds)
+            if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+                print(f"[Split] Train: {len(self.train_ds)}, "
+                      f"Val: {len(self.val_ds)}, Test: {len(self.test_ds)}")
 
     def train_dataloader(self):
         return DataLoader(
@@ -432,6 +527,37 @@ class AerialDataModule(pl.LightningDataModule):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Reconstruction visualisation callback
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ReconVizCallback(pl.Callback):
+    """Runs ae-test.py after each epoch and saves output as 1m-ae_check-mmd-{epoch:04d}.png."""
+
+    def __init__(self, script_path: str):
+        self.script_path = pathlib.Path(script_path).resolve()
+
+    def on_train_epoch_end(self, trainer, _pl_module):
+        if trainer.global_rank != 0:
+            return
+        import subprocess, shutil
+        epoch = trainer.current_epoch
+        result = subprocess.run(
+            [sys.executable, str(self.script_path)],
+            cwd=str(self.script_path.parent),
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"[ReconViz] ae-test.py failed (epoch {epoch}):\n{result.stderr}")
+            return
+        src = self.script_path.parent / "1m-ae_check.png"
+        dst = self.script_path.parent / f"1m-ae_check-{epoch:04d}.png"
+        if src.exists():
+            shutil.move(str(src), str(dst))
+        else:
+            print(f"[ReconViz] ae-test.py succeeded but {src} not found")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -442,9 +568,9 @@ def main():
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Path to NPZ tile directory")
     parser.add_argument("--config", type=str, default=None,
-                        help="Path to YAML config (default: config_10m.yaml)")
+                        help="Path to YAML config (default: config_1m.yaml)")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="VAE learning rate")
     parser.add_argument("--lr_disc", type=float, default=4e-4,
@@ -458,7 +584,7 @@ def main():
                         help="GAN loss weight")
     parser.add_argument("--lam_lpips", type=float, default=1.0,
                         help="LPIPS perceptual loss weight")
-    parser.add_argument("--gan_warmup_epochs", type=int, default=10,
+    parser.add_argument("--gan_warmup_epochs", type=int, default=1,
                         help="Epochs before GAN discriminator activates")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--train_frac", type=float, default=0.95)
@@ -468,16 +594,25 @@ def main():
                         help="Training precision: 32, 16-mixed, bf16-mixed")
     parser.add_argument("--devices", type=int, default=4,
                         help="Number of GPUs (0 = CPU)")
+    parser.add_argument("--augment", action="store_true",
+                        help="Expand training set 8× with D4 flips+rotations (val unaffected)")
+    parser.add_argument("--crop_size", type=int, default=None,
+                        help="Random crop size for training (e.g. 256 or 512). "
+                             "Must be divisible by VAE downscale factor.")
     parser.add_argument("--patience", type=int, default=20,
                         help="Early stopping patience (epochs). 0 = disabled.")
     parser.add_argument("--log_dir", type=str, default="lightning_logs",
                         help="TensorBoard log directory")
+    parser.add_argument("--recon_viz", action="store_true",
+                        help="Run ae-test.py after each epoch and save reconstruction images.")
+    parser.add_argument("--ckpt_path", type=str, default=None,
+                        help="Resume training from checkpoint (restores weights, optimizer, epoch).")
     args = parser.parse_args()
 
     # ── Config ──────────────────────────────────────────────────────────────
     if args.config is None:
         config_path = (pathlib.Path(__file__).resolve().parent.parent
-                       / "opensr_model" / "configs" / "config_10m.yaml")
+                       / "opensr_model" / "configs" / "config_1m.yaml")
     else:
         config_path = pathlib.Path(args.config)
     config = OmegaConf.load(config_path)
@@ -494,13 +629,13 @@ def main():
         args.data_dir, batch_size=args.batch_size,
         num_workers=args.num_workers,
         train_frac=args.train_frac, val_frac=args.val_frac,
-        test_frac=args.test_frac,
+        test_frac=args.test_frac, augment=args.augment, crop_size=args.crop_size,
     )
 
     # ── Callbacks ───────────────────────────────────────────────────────────
     callbacks = [
         ModelCheckpoint(
-            dirpath="checkpoints/vae",
+            dirpath="checkpoints/1m/vae",
             filename="vae-{epoch:04d}-{val_loss:.6f}",
             monitor="val_loss",
             mode="min",
@@ -511,6 +646,10 @@ def main():
     ]
     if args.patience > 0:
         callbacks.append(EarlyStopping(monitor="val_loss", patience=args.patience, mode="min", verbose=True))
+    if args.recon_viz:
+        ae_script = pathlib.Path(__file__).resolve().parent.parent / "ae-test.py"
+        if ae_script.exists():
+            callbacks.append(ReconVizCallback(str(ae_script)))
 
     # ── Logger ──────────────────────────────────────────────────────────────
     logger = TensorBoardLogger(save_dir=args.log_dir, name="vae_aerial")
@@ -529,23 +668,28 @@ def main():
     )
 
     # ── Train ───────────────────────────────────────────────────────────────
-    print(f"\n{'=' * 60}")
-    print(f"Phase 1: Training AutoencoderKL on aerial RGBNIR")
-    print(f"  Input:   (B, 4, 256, 256)  aerial RGBNIR")
-    print(f"  Latent:  (B, 4, 64, 64)")
-    print(f"  Loss:    lam_WD={args.lam_wd} * WD(z)")
-    print(f"         + lam_MAE={args.lam_mae} * MAE(xhat)")
-    print(f"         + lam_GAN={args.lam_gan} * GAN(xhat)  [warm-up: {args.gan_warmup_epochs} epochs]")
-    print(f"         + lam_LPIPS={args.lam_lpips} * LPIPS(xhat)")
-    print(f"{'=' * 60}\n")
+    if trainer.global_rank == 0:
+        _ch_mult = list(config.first_stage_config.ch_mult)
+        _resolution = config.first_stage_config.resolution
+        _latent = _resolution // (2 ** (len(_ch_mult) - 1))
+        print(f"\n{'=' * 60}")
+        print(f"Phase 1: Training AutoencoderKL on aerial RGBNIR")
+        print(f"  Input:   (B, 4, {_resolution}, {_resolution})  aerial RGBNIR")
+        print(f"  Latent:  (B, 4, {_latent}, {_latent})")
+        print(f"  Loss:    lam_WD={args.lam_wd} * WD(z)")
+        print(f"         + lam_MAE={args.lam_mae} * MAE(xhat)")
+        print(f"         + lam_GAN={args.lam_gan} * GAN(xhat)  [warm-up: {args.gan_warmup_epochs} epochs]")
+        print(f"         + lam_LPIPS={args.lam_lpips} * LPIPS(xhat)")
+        print(f"{'=' * 60}\n")
 
-    trainer.fit(model, dm)
+    trainer.fit(model, dm, ckpt_path=args.ckpt_path)
 
-    print(f"\nPhase 1 complete!")
-    print(f"  Best checkpoint: checkpoints/vae/")
-    print(f"\nNext step — Phase 2: Train UNet denoiser")
-    print(f"  python train_unet.py --data_dir {args.data_dir} "
-          f"--vae_ckpt checkpoints/vae/last.ckpt")
+    if trainer.global_rank == 0:
+        print(f"\nPhase 1 complete!")
+        print(f"  Best checkpoint: checkpoints/1m/vae/")
+        print(f"\nNext step — Phase 2: Train UNet denoiser")
+        print(f"  python train_unet.py --data_dir {args.data_dir} "
+              f"--vae_ckpt checkpoints/1m/vae/last.ckpt")
 
 
 if __name__ == "__main__":

@@ -29,14 +29,13 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from opensr_model.srmodel import SRLatentDiffusion
-from opensr_model.data import FusionDataset, LR_PAD_SIZE, HR_PAD_SIZE
+from opensr_model.data import FusionDataset, LR_PAD_SIZE, HR_PAD_SIZE, LR_NATIVE, HR_NATIVE, LR_PAD, HR_PAD
 
-DEFAULT_UNET_CKPT = ROOT / "checkpoints" / "unet" / "last.ckpt"
-DEFAULT_INPUT_DIR = pathlib.Path("~/npz/apr2025/5m-untouched").expanduser()
+DEFAULT_UNET_CKPT = ROOT / "checkpoints" / "1m" / "unet" / "last.ckpt"
+DEFAULT_INPUT_DIR = pathlib.Path("~/npz/apr2025/1m-untouched").expanduser()
 
-# Native (unpadded) tile sizes
-ORIG_LR = 100   # S1/S2 native pixels
-ORIG_HR = 200   # Aerial native pixels
+ORIG_LR = LR_NATIVE   # 100
+ORIG_HR = HR_NATIVE   # 1000
 
 
 def load_trained_weights(model: SRLatentDiffusion, unet_ckpt: str):
@@ -116,12 +115,11 @@ def main():
     if args.opensr:
         run_dir = pathlib.Path(args.out_dir) / f"opensr_steps{args.steps}_gs{args.guidance}"
     else:
-        # Extract epoch label from checkpoint filename (e.g. epoch=10-val_loss=0.279687 -> e10-val0.279687)
         ckpt_stem = pathlib.Path(args.unet_ckpt).stem
-        m = re.search(r'epoch=(\d+).*val_loss=([\d.]+)', ckpt_stem)
-        ckpt_label = f"e{int(m.group(1))}-val{m.group(2)}" if m else ckpt_stem
-        modality_suffix = f"_{args.include}only" if args.include != "all" else ""
-        run_dir = pathlib.Path(args.out_dir) / f"{ckpt_label}_batch_steps{args.steps}_gs{args.guidance}{modality_suffix}"
+        m = re.search(r'epoch=(\d+)', ckpt_stem)
+        g_str = f"g{args.guidance:g}"
+        ckpt_label = f"1m-e{int(m.group(1))}-{g_str}" if m else f"1m-{ckpt_stem}-{g_str}"
+        run_dir = pathlib.Path(args.out_dir) / ckpt_label
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {run_dir}")
 
@@ -129,7 +127,7 @@ def main():
     if args.opensr:
         cfg = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_opensr.yaml")
     else:
-        cfg = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_10m.yaml")
+        cfg = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_1m.yaml")
     print("Building SRLatentDiffusion...")
     model = SRLatentDiffusion(cfg, device=device)
 
@@ -180,43 +178,49 @@ def main():
         return
     print(f"Processing {len(ds)} tiles...")
 
-    lr_pad = (LR_PAD_SIZE - ORIG_LR) // 2
-    hr_pad = (HR_PAD_SIZE - ORIG_HR) // 2
+    lr_pad = LR_PAD   # 14
+    hr_pad = HR_PAD   # 12
 
     for i in tqdm(range(len(ds)), desc="Inference"):
         sample = ds[i]
         name = pathlib.Path(sample["path"]).stem
 
-        s1 = sample["s1"].unsqueeze(0)   # (1, 2, 128, 128)
-        s2 = sample["s2"].unsqueeze(0)   # (1, 4, 128, 128)
-        aerial = sample["aerial"].unsqueeze(0)  # (1, 4, 256, 256) — zeros if no aerial in tile
+        s1 = sample["s1"].unsqueeze(0)   # (1, 2, 128, 128) zero-padded
+        s2 = sample["s2"].unsqueeze(0)   # (1, 4, 128, 128) zero-padded
+        aerial = sample["aerial"].unsqueeze(0)
         has_aerial = aerial.any().item()
+
+        # Crop to native size before passing to model.forward().
+        # model.forward() internally pads with reflect mode via assert_tensor_validity,
+        # so the no_data_mask won't trigger on the border (non-zero reflect values).
+        s2_native = s2[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]  # (1,4,100,100)
+        s1_native = s1[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]  # (1,2,100,100)
 
         with torch.no_grad():
             sr: torch.Tensor = model.forward(
-                s2.to(device), s1.to(device),
+                s2_native.to(device), s1_native.to(device),
                 sampling_steps=args.steps,
                 guidance_scale=args.guidance,
                 histogram_matching=False,
-            )  # (1, 4, 256, 256), values 0-255
+            )  # (1, 4, 912, 912) after revert_padding strips 14*4=56px each side from 1024
 
-        # Crop padding back to native sizes
-        s2_crop = s2[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]
+        # Crop display inputs back to native
+        s2_crop = s2_native
         if args.opensr:
-            # 4× model: output is 512×512, native content is 400×400 offset by the upscaled pad
+            # 4× model: output is 400×400 (revert_padding already applied correctly)
             display_hr = ORIG_LR * 4          # 400
-            _pad = lr_pad * 4                 # 14 * 4 = 56 — zero-pad border at 4× scale
-            sr_crop = sr[:, :, _pad:_pad + display_hr, _pad:_pad + display_hr].cpu()
+            sr_crop = sr.cpu()
         else:
-            display_hr = ORIG_HR
-            s1_crop = s1[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]
-            sr_crop = sr[:, :, hr_pad:hr_pad + ORIG_HR, hr_pad:hr_pad + ORIG_HR].cpu()
+            display_hr = ORIG_HR   # 1000 for all panels
+            s1_crop = s1_native
+            sr_crop = sr.cpu()     # 912×912, no black border
             aerial_crop = aerial[:, :, hr_pad:hr_pad + ORIG_HR, hr_pad:hr_pad + ORIG_HR]
 
-        # Upsample S2 to display resolution for side-by-side comparison
+        # Upsample LR inputs and SR to display resolution for side-by-side comparison
         s2_up = F.interpolate(s2_crop, size=(display_hr, display_hr), mode="bilinear", align_corners=False)
         if not args.opensr:
             s1_up = F.interpolate(s1_crop, size=(display_hr, display_hr), mode="bilinear", align_corners=False)
+            sr_up = F.interpolate(sr_crop, size=(display_hr, display_hr), mode="bilinear", align_corners=False)
 
         # Build panel images
         if args.opensr:
@@ -231,7 +235,7 @@ def main():
             s2_max = s2_up[:, :3].max().clamp(min=1e-6)
             s2_rgb = (s2_up / s2_max * 255).clamp(0, 255)
             s2_img = tensor_to_rgb(s2_rgb)
-            sr_img = tensor_to_rgb(sr_crop)
+            sr_img = tensor_to_rgb(sr_up)
 
         if args.opensr:
             from PIL import ImageDraw

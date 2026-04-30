@@ -104,7 +104,7 @@ class SRLatentDiffusion(torch.nn.Module):
                 mode='bilinear',
                 align_corners=False
             )
-            cond_s2 = self.model.first_stage_model.encode(X_s2_up).sample()
+            cond_s2 = self.model.first_stage_model.encode(X_s2_up).mode()
         else:
             # Skip VAE, just resize to latent spatial size
             cond_s2 = torch.nn.functional.interpolate(

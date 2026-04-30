@@ -1,5 +1,6 @@
 # test_ae.py
 import torch, numpy as np, matplotlib
+import glob
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
@@ -8,20 +9,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opensr_model.autoencoder.autoencoder import AutoencoderKL
 from opensr_model.utils import normalize_aerial
 
-# Load and stack aerial RGBNIR as uint8, pad to 256x256 (same as training)
-data = np.load("/home/jlund/npz/apr2025/5m-npz/2025_1km_6058_657.npz")
-img = np.stack([data["aerial_r"], data["aerial_g"], data["aerial_b"], data["aerial_nir"]])  # (4, 200, 200)
-img = torch.from_numpy(img).float().unsqueeze(0)  # (1, 4, 200, 200)
-img = F.pad(img, (0, 56, 0, 56))  # zero-pad to 256x256
+# Load and stack aerial RGBNIR as uint8, pad to 1024x1024 (same as training)
+data = np.load("/home/jlund/npz/apr2025/1m-npz/2025_1km_6081_525.npz")
+img = np.stack([data["aerial_r"], data["aerial_g"], data["aerial_b"], data["aerial_nir"]])  # (4, 1000, 1000)
+img = torch.from_numpy(img).float().unsqueeze(0)  # (1, 4, 1000, 1000)
+img = F.pad(img, (12, 12, 12, 12))  # symmetric zero-pad to 1024x1024
 x = normalize_aerial(img, stage="norm")  # -> [-1, 1]
 print(f"Shape: {x.shape}, range: {x.min():.3f} to {x.max():.3f}")
 
 # Build autoencoder and load weights
-ae = AutoencoderKL(dict(z_channels=4, ch=128, out_ch=4, ch_mult=[1,2,4],
-    resolution=512, in_channels=4, double_z=True, num_res_blocks=2,
+ae = AutoencoderKL(dict(z_channels=4, ch=128, out_ch=4, ch_mult=[1,2,4,8],
+    resolution=1024, in_channels=4, double_z=True, num_res_blocks=2,
     attn_resolutions=[], dropout=0.0), embed_dim=4)
 
-ckpt = torch.load("/home/jlund/opensr-model/checkpoints/vae/vae-epoch=0016-val_loss=4.619567.ckpt", map_location="cpu")
+# matches = glob.glob("/home/jlund/opensr-model/checkpoints/1m/vae/vae-epoch=0005*.ckpt")
+# ckpt = torch.load(matches[0], map_location="cpu")
+ckpt = torch.load("/home/jlund/opensr-model/checkpoints/1m/vae/last.ckpt", map_location="cpu")
 state = ckpt["state_dict"]
 # Strip 'vae.' prefix from LightningModule state_dict
 ae.load_state_dict({k.replace("vae.", "", 1): v for k, v in state.items() if k.startswith("vae.")})
@@ -61,5 +64,5 @@ axes[2, 3].axis('off')
 
 plt.suptitle(f'AE Reconstruction — MAE: {mae:.4f}', fontsize=14)
 plt.tight_layout()
-plt.savefig('ae_check.png', dpi=150)
-print("Saved ae_check.png")
+plt.savefig('1m-ae_check.png', dpi=150)
+print("Saved 1m-ae_check.png")

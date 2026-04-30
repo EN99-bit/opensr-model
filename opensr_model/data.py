@@ -27,6 +27,7 @@ Usage:
         s1, s2, aerial = batch["s1"], batch["s2"], batch["aerial"]
 """
 
+import os
 import pathlib
 from typing import Union, List, Optional
 import numpy as np
@@ -34,9 +35,19 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from opensr_model.utils import normalize_s1
+
+# Native (unpadded) tile sizes
+LR_NATIVE = 100    # S1/S2 native pixels per tile
+HR_NATIVE = 1000   # Aerial native pixels per tile
+
 # Padded output sizes (must be divisible by 2^num_downsamples for UNet)
 LR_PAD_SIZE = 128   # S1/S2 padded spatial size
-HR_PAD_SIZE = 256   # Aerial padded spatial size
+HR_PAD_SIZE = 1024  # Aerial padded spatial size (1000×1000 → 1024×1024)
+
+# Number of zero-padded pixels on each side in padded space
+LR_PAD = (LR_PAD_SIZE - LR_NATIVE) // 2   # 14
+HR_PAD = (HR_PAD_SIZE - HR_NATIVE) // 2   # 12
 
 
 class FusionDataset(Dataset):
@@ -81,8 +92,9 @@ class FusionDataset(Dataset):
             if self._tile_ok(p):
                 self.paths.append(p)
 
-        print(f"[FusionDataset] {len(self.paths)}/{len(all_paths)} tiles accepted "
-              f"(require_aerial={require_aerial}, pad={pad})")
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            print(f"[FusionDataset] {len(self.paths)}/{len(all_paths)} tiles accepted "
+                  f"(require_aerial={require_aerial}, pad={pad})")
 
     # ------------------------------------------------------------------
     # Filtering
@@ -169,6 +181,83 @@ class FusionDataset(Dataset):
         }
 
 
+class LatentFusionDataset(Dataset):
+    """Loads pre-computed VAE latents + raw S1 for UNet training.
+
+    Expects a directory of .pt files (one per tile) produced by
+    scripts/precompute_latents.py, each containing:
+        z_aerial : (4, 128, 128) float16
+        z_s2     : (4, 128, 128) float16
+
+    S1 is loaded from the original NPZ and normalized on-the-fly (cheap).
+
+    Args:
+        root:       Path to directory containing original .npz files.
+        latent_dir: Path to directory containing pre-computed .pt files.
+        file_list:  Optional explicit list of .npz paths (overrides root scan).
+    """
+
+    S1_KEYS = ["s1_vv", "s1_vh"]
+
+    def __init__(
+        self,
+        root: Union[str, pathlib.Path],
+        latent_dir: Union[str, pathlib.Path],
+        file_list: Optional[List[str]] = None,
+    ):
+        super().__init__()
+        self.latent_dir = pathlib.Path(latent_dir)
+
+        if file_list is not None:
+            all_paths = [pathlib.Path(p) for p in file_list]
+        else:
+            root = pathlib.Path(root)
+            all_paths = sorted(root.rglob("*.npz"))
+
+        self.paths: List[pathlib.Path] = []
+        for p in all_paths:
+            if self._tile_ok(p):
+                self.paths.append(p)
+
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            print(f"[LatentFusionDataset] {len(self.paths)}/{len(all_paths)} tiles accepted "
+                  f"(latent_dir={self.latent_dir})")
+
+    def _tile_ok(self, path: pathlib.Path) -> bool:
+        if not (self.latent_dir / f"{path.stem}.pt").exists():
+            return False
+        try:
+            with np.load(path, allow_pickle=True) as npz:
+                return all(k in npz for k in self.S1_KEYS)
+        except Exception:
+            return False
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> dict:
+        path = self.paths[idx]
+        lat = torch.load(
+            self.latent_dir / f"{path.stem}.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        with np.load(path, allow_pickle=True) as npz:
+            s1 = torch.from_numpy(
+                np.stack([npz[k].astype(np.float32) for k in self.S1_KEYS])
+            )  # (2, 100, 100) raw
+
+        s1 = FusionDataset._zero_pad(s1, LR_PAD_SIZE)  # → (2, 128, 128)
+        s1_cond = normalize_s1(s1, stage="norm")
+
+        return {
+            "z_aerial": lat["z_aerial"],  # (4, 128, 128) float16
+            "z_s2":     lat["z_s2"],      # (4, 128, 128) float16
+            "s1_cond":  s1_cond,          # (2, 128, 128) float32
+            "path":     str(path),
+        }
+
+
 # ------------------------------------------------------------------
 # Convenience: train/val split
 # ------------------------------------------------------------------
@@ -211,5 +300,6 @@ def make_train_val_datasets(
         pad=pad,
     )
 
-    print(f"[Split] Train: {len(train_ds)}, Val: {len(val_ds)}")
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        print(f"[Split] Train: {len(train_ds)}, Val: {len(val_ds)}")
     return train_ds, val_ds

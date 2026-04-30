@@ -6,11 +6,11 @@ Usage:
     python train_unet.py --data_dir /path/to/npz_tiles --vae_ckpt /path/to/vae.ckpt
     python train_unet.py --data_dir data --vae_ckpt checkpoints/vae.ckpt --epochs 50 --batch_size 4
 
-Training flow per step (5 m aerial, scale_factor=2, padded 128→256):
-    1. aerial (B,4,256,256) → normalize [-1,1] → VAE encode → z_0 (B,4,64,64)
-    2. S2 (B,4,128,128) → normalize → upsample 256 → VAE encode → cond_s2 (B,4,64,64)
-       S1 (B,2,128,128) → normalize → upsample 64             → cond_s1 (B,2,64,64)
-       conditioning = concat(cond_s2, cond_s1) → (B,6,64,64)
+Training flow per step (1m aerial, scale_factor=8, padded 128→1024):
+    1. aerial (B,4,1024,1024) → normalize [-1,1] → VAE encode → z_0 (B,4,128,128)
+    2. S2 (B,4,128,128) → normalize → upsample 1024 → VAE encode → cond_s2 (B,4,128,128)
+       S1 (B,2,128,128) → normalize                             → cond_s1 (B,2,128,128)
+       conditioning = concat(cond_s2, cond_s1) → (B,6,128,128)
     3. Sample t ~ Uniform(0, T), eps ~ N(0, I)
     4. z_t = sqrt(α̅_t) · z_0 + sqrt(1−α̅_t) · eps
     5. eps_pred = UNet(concat(z_t, conditioning), t)
@@ -36,7 +36,7 @@ from pytorch_lightning.tuner import Tuner
 # Add project root to path so opensr_model is importable
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from opensr_model.data import FusionDataset
+from opensr_model.data import FusionDataset, LatentFusionDataset
 from opensr_model.diffusion.latentdiffusion import LatentDiffusion
 from opensr_model.utils import normalize_s1, normalize_s2, normalize_aerial
 
@@ -52,7 +52,7 @@ class LitUNetDenoiser(pl.LightningModule):
     Conditioning is built on-the-fly from S1+S2 inputs.
     """
 
-    def __init__(self, config, vae_ckpt: str = None, lr: float = 1e-4, max_epochs: int = 100, warmup_epochs: int = 5, cfg_dropout: float = 0.15, no_warmup: bool = False):
+    def __init__(self, config, vae_ckpt: str = None, lr: float = 1e-4, max_epochs: int = 100, warmup_epochs: int = 5, cfg_dropout: float = 0.15, no_warmup: bool = False, use_precomputed: bool = False):
         super().__init__()
         self.save_hyperparameters(ignore=["config"])
         self.config = config
@@ -61,6 +61,7 @@ class LitUNetDenoiser(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.cfg_dropout = cfg_dropout
         self.no_warmup = no_warmup
+        self.use_precomputed = use_precomputed
 
         # Derived sizes from config
         self.scale_factor = config.scale_factor
@@ -155,15 +156,21 @@ class LitUNetDenoiser(pl.LightningModule):
 
         Returns MSE loss between predicted and actual noise.
         """
-        s1 = batch["s1"]         # (B, 2, 128, 128)
-        s2 = batch["s2"]         # (B, 4, 128, 128)
-        aerial = batch["aerial"] # (B, 4, 256, 256)
+        if "z_aerial" in batch:
+            # Pre-computed path — no VAE VRAM
+            z_0     = batch["z_aerial"].float().to(self.device)  # (B, 4, 128, 128)
+            cond_s2 = batch["z_s2"].float().to(self.device)      # (B, 4, 128, 128)
+            cond_s1 = batch["s1_cond"].to(self.device)           # (B, 2, 128, 128)
+            conditioning = torch.cat([cond_s2, cond_s1], dim=1)  # (B, 6, 128, 128)
+            if self.global_step == 0 and self.training:
+                print(f"[z_0] mean={z_0.mean():.4f}  std={z_0.std():.4f}  "
+                      f"(expect ~0 and ~1 if latents are well-scaled)")
+        else:
+            # On-the-fly path — original behaviour
+            z_0          = self._encode_aerial(batch["aerial"])
+            conditioning = self._build_conditioning(batch["s2"], batch["s1"])
 
-        # 1. Encode aerial → z_0
-        z_0 = self._encode_aerial(aerial)
-
-        # 2. Build conditioning from S1+S2 (drop to zeros with cfg_dropout probability)
-        conditioning = self._build_conditioning(s2, s1)
+        # Drop conditioning with cfg_dropout probability (classifier-free guidance)
         if self.cfg_dropout > 0 and self.training:
             mask = (torch.rand(conditioning.shape[0], 1, 1, 1, device=conditioning.device) > self.cfg_dropout)
             conditioning = conditioning * mask
@@ -204,9 +211,16 @@ class LitUNetDenoiser(pl.LightningModule):
             scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[self.warmup_epochs])
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
+    def on_fit_start(self):
+        if self.use_precomputed:
+            self.ldm.first_stage_model.cpu()
+            torch.cuda.empty_cache()
+            print("[UNet] VAE offloaded to CPU — using pre-computed latents")
+
     def on_train_epoch_start(self):
-        # Ensure VAE stays frozen and in eval mode
-        self.ldm.first_stage_model.eval()
+        # Ensure VAE stays frozen and in eval mode (or on CPU if precomputed)
+        if not self.use_precomputed:
+            self.ldm.first_stage_model.eval()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -228,23 +242,21 @@ class AugmentedDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.base[idx]
-        s1, s2, aerial = sample["s1"], sample["s2"], sample["aerial"]
+        if "z_aerial" in sample:
+            aug_keys = ["z_aerial", "z_s2", "s1_cond"]
+        else:
+            aug_keys = ["s1", "s2", "aerial"]
 
-        if torch.rand(1).item() > 0.5:  # horizontal flip
-            s1 = torch.flip(s1, dims=[-1])
-            s2 = torch.flip(s2, dims=[-1])
-            aerial = torch.flip(aerial, dims=[-1])
-        if torch.rand(1).item() > 0.5:  # vertical flip
-            s1 = torch.flip(s1, dims=[-2])
-            s2 = torch.flip(s2, dims=[-2])
-            aerial = torch.flip(aerial, dims=[-2])
-        k = torch.randint(0, 4, (1,)).item()  # 90° rotation: 0, 90, 180, 270
+        tensors = [sample[k] for k in aug_keys]
+        if torch.rand(1).item() > 0.5:
+            tensors = [torch.flip(t, dims=[-1]) for t in tensors]
+        if torch.rand(1).item() > 0.5:
+            tensors = [torch.flip(t, dims=[-2]) for t in tensors]
+        k = torch.randint(0, 4, (1,)).item()
         if k > 0:
-            s1 = torch.rot90(s1, k, dims=[-2, -1])
-            s2 = torch.rot90(s2, k, dims=[-2, -1])
-            aerial = torch.rot90(aerial, k, dims=[-2, -1])
+            tensors = [torch.rot90(t, k, dims=[-2, -1]) for t in tensors]
 
-        return {**sample, "s1": s1, "s2": s2, "aerial": aerial}
+        return {**sample, **dict(zip(aug_keys, tensors))}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -260,7 +272,7 @@ class FusionDataModule(pl.LightningDataModule):
 
     def __init__(self, data_dir: str, batch_size: int = 2, num_workers: int = 4,
                  train_frac: float = 0.8, val_frac: float = 0.1, test_frac: float = 0.1,
-                 seed: int = 42, augment: bool = False):
+                 seed: int = 42, augment: bool = False, latent_dir=None):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -270,13 +282,17 @@ class FusionDataModule(pl.LightningDataModule):
         self.test_frac = test_frac
         self.seed = seed
         self.augment = augment
+        self.latent_dir = latent_dir
         self.train_ds = None
         self.val_ds = None
         self.test_ds = None
 
     def setup(self, stage=None):
         if self.train_ds is None:
-            full_ds = FusionDataset(root=self.data_dir)
+            if self.latent_dir:
+                full_ds = LatentFusionDataset(root=self.data_dir, latent_dir=self.latent_dir)
+            else:
+                full_ds = FusionDataset(root=self.data_dir)
             self.train_ds, self.val_ds, self.test_ds = random_split(
                 full_ds,
                 [self.train_frac, self.val_frac, self.test_frac],
@@ -325,12 +341,18 @@ def main():
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--val_frac", type=float, default=0.1)
     parser.add_argument("--test_frac", type=float, default=0.1)
-    parser.add_argument("--precision", type=str, default="32", help="Training precision: 32, 16-mixed, bf16-mixed")
+    parser.add_argument("--precision", type=str, default="16-mixed", help="Training precision: 32, 16-mixed, bf16-mixed")
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs). 0 = disabled.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--find_lr", action="store_true", default=False, help="Run LR range test and save plot, then exit")
     parser.add_argument("--log_dir", type=str, default="lightning_logs", help="TensorBoard log directory")
+    parser.add_argument("--latent_dir", type=str, default=None,
+                        help="Path to pre-computed VAE latent .pt files. If set, skips on-the-fly VAE encoding.")
     args = parser.parse_args()
+
+    if args.vae_ckpt is None:
+        print("WARNING: --vae_ckpt not set. The checkpoint will contain randomly-initialized "
+              "VAE weights, making inference unusable. Pass --vae_ckpt to fix this.")
 
     # ── Config ──────────────────────────────────────────────────────────────
     if args.config is None:
@@ -341,16 +363,17 @@ def main():
     print(f"Config: {config_path}")
 
     # ── Model + Data ────────────────────────────────────────────────────────
-    model = LitUNetDenoiser(config, vae_ckpt=args.vae_ckpt, lr=args.lr, max_epochs=args.epochs, warmup_epochs=args.warmup_epochs, cfg_dropout=args.cfg_dropout, no_warmup=args.no_warmup)
+    model = LitUNetDenoiser(config, vae_ckpt=args.vae_ckpt, lr=args.lr, max_epochs=args.epochs, warmup_epochs=args.warmup_epochs, cfg_dropout=args.cfg_dropout, no_warmup=args.no_warmup, use_precomputed=args.latent_dir is not None)
     dm = FusionDataModule(args.data_dir, batch_size=args.batch_size,
                           num_workers=args.num_workers,
                           train_frac=args.train_frac, val_frac=args.val_frac,
-                          test_frac=args.test_frac, augment=args.augment)
+                          test_frac=args.test_frac, augment=args.augment,
+                          latent_dir=args.latent_dir)
 
     # ── Callbacks ───────────────────────────────────────────────────────────
     callbacks = [
         ModelCheckpoint(
-            dirpath="checkpoints/unet",
+            dirpath="checkpoints/1m/unet",
             filename="unet-{epoch:04d}-{val_loss:.6f}",
             monitor="val_loss",
             mode="min",
