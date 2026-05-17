@@ -204,6 +204,20 @@ class SRLatentDiffusion(torch.nn.Module):
         noise   = sigma_t * torch.randn_like(latent) * temperature
         return a_prev.sqrt() * pred_x0 + dir_xt + noise
 
+    def _ddim_step_cfg_pp(self, latent, e_cond, e_uncond, guidance_scale, index, ddim, temperature):
+        """CFG++ DDIM step: guidance applied in x0-space, direction kept from conditioned pass."""
+        B, device = latent.shape[0], latent.device
+        a_t      = torch.full((B, 1, 1, 1), ddim.ddim_alphas[index],                   device=device)
+        a_prev   = torch.full((B, 1, 1, 1), ddim.ddim_alphas_prev[index],              device=device)
+        sigma_t  = torch.full((B, 1, 1, 1), ddim.ddim_sigmas[index],                   device=device)
+        sqrt_1ma = torch.full((B, 1, 1, 1), ddim.ddim_sqrt_one_minus_alphas[index],    device=device)
+        pred_x0_cond   = (latent - sqrt_1ma * e_cond)   / a_t.sqrt()
+        pred_x0_uncond = (latent - sqrt_1ma * e_uncond) / a_t.sqrt()
+        pred_x0_guided = pred_x0_cond + guidance_scale * (pred_x0_cond - pred_x0_uncond)
+        dir_xt = (1.0 - a_prev - sigma_t ** 2).sqrt() * e_cond
+        noise  = sigma_t * torch.randn_like(latent) * temperature
+        return a_prev.sqrt() * pred_x0_guided + dir_xt + noise
+
     @torch.no_grad()
     def forward(
         self,
@@ -216,6 +230,8 @@ class SRLatentDiffusion(torch.nn.Module):
         save_iterations: bool = False,
         verbose: bool = False,
         guidance_scale: float = 1.0,
+        cfg_plus_plus: bool = False,
+        apply_nodata_mask: bool = True,
     ):
         """Obtain the super resolution from fused S2+S1 input.
 
@@ -266,12 +282,16 @@ class SRLatentDiffusion(torch.nn.Module):
             index = sampling_steps - i - 1
             t = torch.full((latent.shape[0],), step, device=conditioning.device, dtype=torch.long)
 
-            if guidance_scale > 1.0:
-                # CFG: two UNet passes, amplify conditioned direction
+            if cfg_plus_plus or guidance_scale > 1.0:
                 e_t_uncond = self.model.apply_model(latent, t, cond=null_conditioning)
                 e_t_cond   = self.model.apply_model(latent, t, cond=conditioning)
-                e_t = e_t_uncond + guidance_scale * (e_t_cond - e_t_uncond)
-                latent = self._ddim_step(latent, e_t, index, ddim, sampling_temperature)
+                if cfg_plus_plus:
+                    latent = self._ddim_step_cfg_pp(
+                        latent, e_t_cond, e_t_uncond, guidance_scale, index, ddim, sampling_temperature
+                    )
+                else:
+                    e_t = e_t_uncond + guidance_scale * (e_t_cond - e_t_uncond)
+                    latent = self._ddim_step(latent, e_t, index, ddim, sampling_temperature)
             else:
                 outs = ddim.p_sample_ddim(
                     x=latent, c=conditioning, t=step, index=index,
@@ -290,7 +310,8 @@ class SRLatentDiffusion(torch.nn.Module):
         sr = self._tensor_decode(latent, spe_cor=histogram_matching) # decode the latent image
 
         # Post-processing
-        sr = apply_no_data_mask(sr, no_data_mask) # apply no data mask as in LR image
+        if apply_nodata_mask:
+            sr = apply_no_data_mask(sr, no_data_mask)
         sr = revert_padding(sr, padding) # remove padding from the SR image if there was any
         return sr
 

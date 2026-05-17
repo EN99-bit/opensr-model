@@ -18,6 +18,7 @@ Training flow per step (1m aerial, scale_factor=8, padded 128→1024):
 """
 
 import argparse
+import math
 import pathlib
 import sys
 
@@ -259,6 +260,31 @@ class AugmentedDataset(Dataset):
         return {**sample, **dict(zip(aug_keys, tensors))}
 
 
+class AugmentedDatasetX8(Dataset):
+    """Expands each tile to all 8 elements of the D4 symmetry group (4 rotations × {id, hflip}).
+
+    len = 8 × len(base). Works for both precomputed-latent and raw batches.
+    """
+    _D4 = [(False,0),(False,1),(False,2),(False,3),(True,0),(True,1),(True,2),(True,3)]
+
+    def __init__(self, base_dataset):
+        self.base = base_dataset
+
+    def __len__(self):
+        return 8 * len(self.base)
+
+    def __getitem__(self, idx):
+        hflip, nrot = self._D4[idx % 8]
+        sample = self.base[idx // 8]
+        keys = ["z_aerial","z_s2","s1_cond"] if "z_aerial" in sample else ["s1","s2","aerial"]
+        ts = [sample[k] for k in keys]
+        if hflip:
+            ts = [torch.flip(t, dims=[-1]) for t in ts]
+        if nrot:
+            ts = [torch.rot90(t, nrot, dims=[-2,-1]) for t in ts]
+        return {**sample, **dict(zip(keys, ts))}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # LightningDataModule
 # ──────────────────────────────────────────────────────────────────────────────
@@ -272,7 +298,7 @@ class FusionDataModule(pl.LightningDataModule):
 
     def __init__(self, data_dir: str, batch_size: int = 2, num_workers: int = 4,
                  train_frac: float = 0.8, val_frac: float = 0.1, test_frac: float = 0.1,
-                 seed: int = 42, augment: bool = False, latent_dir=None):
+                 seed: int = 42, augment: bool = False, augment_d4: bool = False, latent_dir=None):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -282,6 +308,7 @@ class FusionDataModule(pl.LightningDataModule):
         self.test_frac = test_frac
         self.seed = seed
         self.augment = augment
+        self.augment_d4 = augment_d4
         self.latent_dir = latent_dir
         self.train_ds = None
         self.val_ds = None
@@ -298,7 +325,9 @@ class FusionDataModule(pl.LightningDataModule):
                 [self.train_frac, self.val_frac, self.test_frac],
                 generator=torch.Generator().manual_seed(self.seed),
             )
-            if self.augment:
+            if self.augment_d4:
+                self.train_ds = AugmentedDatasetX8(self.train_ds)
+            elif self.augment:
                 self.train_ds = AugmentedDataset(self.train_ds)
             print(f"[Split] Train: {len(self.train_ds)}, Val: {len(self.val_ds)}, Test: {len(self.test_ds)}")
 
@@ -337,6 +366,8 @@ def main():
     parser.add_argument("--no_warmup", action="store_true", default=False, help="Disable LR warmup, use plain CosineAnnealingLR")
     parser.add_argument("--cfg_dropout", type=float, default=0.15, help="Probability of dropping conditioning during training for CFG (0 = disabled)")
     parser.add_argument("--augment", action="store_true", default=False, help="Enable random flip+rotation augmentation on training set")
+    parser.add_argument("--augment_d4", action="store_true", default=False,
+                        help="Expand training set 8× with all D4 symmetry transforms (recommended with --latent_dir)")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--val_frac", type=float, default=0.1)
@@ -346,9 +377,15 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--find_lr", action="store_true", default=False, help="Run LR range test and save plot, then exit")
     parser.add_argument("--log_dir", type=str, default="lightning_logs", help="TensorBoard log directory")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/unet", help="Directory to save model checkpoints")
     parser.add_argument("--latent_dir", type=str, default=None,
                         help="Path to pre-computed VAE latent .pt files. If set, skips on-the-fly VAE encoding.")
     args = parser.parse_args()
+
+    REFERENCE_BATCH_SIZE = 2  # batch used when args.lr default was tuned
+    if args.batch_size != REFERENCE_BATCH_SIZE:
+        args.lr = args.lr * math.sqrt(args.batch_size / REFERENCE_BATCH_SIZE)
+        print(f"[LR scaling] batch_size={args.batch_size} → lr scaled to {args.lr:.2e} (sqrt rule, ref={REFERENCE_BATCH_SIZE})")
 
     if args.vae_ckpt is None:
         print("WARNING: --vae_ckpt not set. The checkpoint will contain randomly-initialized "
@@ -368,12 +405,12 @@ def main():
                           num_workers=args.num_workers,
                           train_frac=args.train_frac, val_frac=args.val_frac,
                           test_frac=args.test_frac, augment=args.augment,
-                          latent_dir=args.latent_dir)
+                          augment_d4=args.augment_d4, latent_dir=args.latent_dir)
 
     # ── Callbacks ───────────────────────────────────────────────────────────
     callbacks = [
         ModelCheckpoint(
-            dirpath="checkpoints/1m/unet",
+            dirpath=args.checkpoint_dir,
             filename="unet-{epoch:04d}-{val_loss:.6f}",
             monitor="val_loss",
             mode="min",
