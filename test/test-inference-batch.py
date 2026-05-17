@@ -86,6 +86,9 @@ def main():
                         help="DDIM sampling steps")
     parser.add_argument("--guidance", type=float, default=6.0,
                         help="Classifier-free guidance scale")
+    parser.add_argument("--cfg_plus_plus", action="store_true", default=False,
+                        help="Use CFG++ (x0-space guidance). Try lower scales (0.05–0.3) "
+                             "— less artifacts than standard CFG at equivalent strength.")
     parser.add_argument("--unet_ckpt", type=str, default=None,
                         help="Path to LitUNetDenoiser Lightning checkpoint")
     parser.add_argument("--out_dir", type=str, default=str(ROOT / "test" / "results"),
@@ -97,6 +100,9 @@ def main():
     parser.add_argument("--opensr", action="store_true",
                         help="Use official OpenSR pretrained weights (S2-only, 8-ch UNet); "
                              "downloads from HuggingFace on first run")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Config yaml path (default: config_opensr.yaml for --opensr, "
+                             "config_1m.yaml otherwise). Use config_10m.yaml for the 5m model.")
     args = parser.parse_args()
 
     if args.opensr and args.unet_ckpt is not None:
@@ -117,17 +123,23 @@ def main():
     else:
         ckpt_stem = pathlib.Path(args.unet_ckpt).stem
         m = re.search(r'epoch=(\d+)', ckpt_stem)
-        g_str = f"g{args.guidance:g}"
-        ckpt_label = f"1m-e{int(m.group(1))}-{g_str}" if m else f"1m-{ckpt_stem}-{g_str}"
+        g_str = f"g{args.guidance:g}{'pp' if args.cfg_plus_plus else ''}"
+        res_tag = "5m" if args.config and "10m" in args.config else "1m"
+        ckpt_label = f"{res_tag}-e{int(m.group(1))}-{g_str}" if m else f"{res_tag}-{ckpt_stem}-{g_str}"
         run_dir = pathlib.Path(args.out_dir) / ckpt_label
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {run_dir}")
 
     # Build model
-    if args.opensr:
-        cfg = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_opensr.yaml")
+    if args.config:
+        cfg_path = pathlib.Path(args.config)
+        if not cfg_path.is_absolute():
+            cfg_path = ROOT / cfg_path
     else:
-        cfg = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_1m.yaml")
+        cfg_path = ROOT / "opensr_model" / "configs" / (
+            "config_opensr.yaml" if args.opensr else "config_1m.yaml"
+        )
+    cfg = OmegaConf.load(cfg_path)
     print("Building SRLatentDiffusion...")
     model = SRLatentDiffusion(cfg, device=device)
 
@@ -171,15 +183,32 @@ def main():
             print(f"Ablation: using {args.include} only (other modality zeroed in conditioning)")
     model.eval()
 
+    # Determine display geometry based on model's scale_factor.
+    # revert_padding() in utils.py hard-codes ×4; correct only for scale_factor≥8.
+    # For scale_factor=2 (5m model) we pass the pre-padded 128×128 input so that
+    # assert_tensor_validity adds no extra padding (padding=0) and revert_padding
+    # becomes a no-op, then we crop the native content manually.
+    lr_pad = LR_PAD   # 14
+    sf = model.scale_factor  # 2 for config_10m (5m), 8 for config_1m (1m)
+    if sf <= 2:
+        # 5m model: pass pre-padded input, crop output manually
+        hr_out     = LR_PAD_SIZE * sf           # 256
+        hr_crop    = lr_pad * sf                # 28 — border in output space
+        display_hr = hr_out - 2 * hr_crop       # 200
+        hr_pad_gt  = (HR_PAD_SIZE - display_hr) // 2  # 412 — where aerial sits in 1024-pad
+        use_native = False
+    else:
+        # 1m model: native input, revert_padding (×4) strips 56px → 912×912
+        display_hr = ORIG_HR   # 1000
+        hr_pad_gt  = HR_PAD    # 12
+        use_native = True
+
     # Load all tiles (aerial optional — GT panel will be blank if absent)
     ds = FusionDataset(args.input_dir, require_aerial=False, pad=True)
     if len(ds) == 0:
         print("No valid tiles found. Exiting.")
         return
-    print(f"Processing {len(ds)} tiles...")
-
-    lr_pad = LR_PAD   # 14
-    hr_pad = HR_PAD   # 12
+    print(f"Processing {len(ds)} tiles (scale_factor={sf}, display={display_hr}×{display_hr})...")
 
     for i in tqdm(range(len(ds)), desc="Inference"):
         sample = ds[i]
@@ -190,19 +219,23 @@ def main():
         aerial = sample["aerial"].unsqueeze(0)
         has_aerial = aerial.any().item()
 
-        # Crop to native size before passing to model.forward().
-        # model.forward() internally pads with reflect mode via assert_tensor_validity,
-        # so the no_data_mask won't trigger on the border (non-zero reflect values).
         s2_native = s2[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]  # (1,4,100,100)
         s1_native = s1[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]  # (1,2,100,100)
 
+        # For scale_factor=2: pass pre-padded 128×128 so assert_tensor_validity is a no-op
+        # (padding=0 → revert_padding strips nothing → output is hr_out×hr_out).
+        # For scale_factor≥8: pass native 100×100; assert_tensor_validity reflect-pads to 128×128.
+        in_s2 = s2_native if use_native else s2
+        in_s1 = s1_native if use_native else s1
+
         with torch.no_grad():
             sr: torch.Tensor = model.forward(
-                s2_native.to(device), s1_native.to(device),
+                in_s2.to(device), in_s1.to(device),
                 sampling_steps=args.steps,
                 guidance_scale=args.guidance,
                 histogram_matching=False,
-            )  # (1, 4, 912, 912) after revert_padding strips 14*4=56px each side from 1024
+                cfg_plus_plus=args.cfg_plus_plus,
+            )
 
         # Crop display inputs back to native
         s2_crop = s2_native
@@ -211,10 +244,14 @@ def main():
             display_hr = ORIG_LR * 4          # 400
             sr_crop = sr.cpu()
         else:
-            display_hr = ORIG_HR   # 1000 for all panels
             s1_crop = s1_native
-            sr_crop = sr.cpu()     # 912×912, no black border
-            aerial_crop = aerial[:, :, hr_pad:hr_pad + ORIG_HR, hr_pad:hr_pad + ORIG_HR]
+            if use_native:
+                sr_crop = sr.cpu()            # 912×912, no further crop
+            else:
+                sr_crop = sr[:, :, hr_crop:hr_crop + display_hr,
+                                   hr_crop:hr_crop + display_hr].cpu()  # e.g. 200×200
+            aerial_crop = aerial[:, :, hr_pad_gt:hr_pad_gt + display_hr,
+                                       hr_pad_gt:hr_pad_gt + display_hr]
 
         # Upsample LR inputs and SR to display resolution for side-by-side comparison
         s2_up = F.interpolate(s2_crop, size=(display_hr, display_hr), mode="bilinear", align_corners=False)

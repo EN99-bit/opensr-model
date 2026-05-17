@@ -250,10 +250,27 @@ class LatentFusionDataset(Dataset):
         s1 = FusionDataset._zero_pad(s1, LR_PAD_SIZE)  # → (2, 128, 128)
         s1_cond = normalize_s1(s1, stage="norm")
 
+        if "aerial_mean" in lat:
+            # New format: sample z ~ N(mean, exp(0.5*logvar)) — recovers on-the-fly stochasticity
+            VAE_SCALE = 0.18215
+            z_aerial = (lat["aerial_mean"].float() + torch.exp(0.5 * lat["aerial_logvar"].float()) * torch.randn(lat["aerial_mean"].shape)) * VAE_SCALE
+            z_s2     = lat["s2_mean"].float() + torch.exp(0.5 * lat["s2_logvar"].float()) * torch.randn(lat["s2_mean"].shape)
+        else:
+            # Backward compat: old files store precomputed mode
+            z_aerial = lat["z_aerial"]
+            z_s2     = lat["z_s2"]
+
+        latent_size = z_aerial.shape[-1]
+        if s1_cond.shape[-1] != latent_size:
+            s1_cond = F.interpolate(
+                s1_cond.unsqueeze(0), size=(latent_size, latent_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+
         return {
-            "z_aerial": lat["z_aerial"],  # (4, 128, 128) float16
-            "z_s2":     lat["z_s2"],      # (4, 128, 128) float16
-            "s1_cond":  s1_cond,          # (2, 128, 128) float32
+            "z_aerial": z_aerial,  # (4, latent_size, latent_size)
+            "z_s2":     z_s2,      # (4, latent_size, latent_size)
+            "s1_cond":  s1_cond,   # (2, latent_size, latent_size) float32
             "path":     str(path),
         }
 

@@ -35,7 +35,7 @@ first_stage_config:
   attn_resolutions: []
   dropout: 0.0
 
-# Denoising UNet Settings
+# Denoising UNet Settingsm
 cond_stage_config:
   image_size: 128
   in_channels: 10
