@@ -22,12 +22,15 @@ Usage:
 import argparse
 import csv
 import pathlib
+import shlex
 import sys
 
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
+from PIL import Image, ImageDraw, ImageFont
 from skimage.metrics import structural_similarity, peak_signal_noise_ratio
 from tqdm import tqdm
 
@@ -58,6 +61,36 @@ METRIC_LABELS = {
     "psnr":        "PSNR ↑",
     "ssim":        "SSIM ↑",
 }
+
+
+def percentile_stretch_to_uint8(arr: np.ndarray, lo_pct: float = 2, hi_pct: float = 98) -> np.ndarray:
+    lo, hi = np.percentile(arr, lo_pct), np.percentile(arr, hi_pct)
+    return (np.clip((arr - lo) / (hi - lo + 1e-6), 0, 1) * 255).astype(np.uint8)
+
+
+def aerial_to_rgb_png(t: torch.Tensor) -> np.ndarray:
+    """(C, H, W) or (1, C, H, W) in [0, 255] → HxWx3 uint8 RGB (drop NIR)."""
+    if t.dim() == 4:
+        t = t[0]
+    img = t[:3].cpu().numpy()
+    return np.transpose(np.clip(img, 0, 255).astype(np.uint8), (1, 2, 0))
+
+
+def s1_to_rgb_png(t: torch.Tensor) -> np.ndarray:
+    """(2, H, W) or (1, 2, H, W) VV/VH dB → HxWx3 uint8 (VV, VH, VV)."""
+    if t.dim() == 4:
+        t = t[0]
+    vv = percentile_stretch_to_uint8(t[0].cpu().numpy())
+    vh = percentile_stretch_to_uint8(t[1].cpu().numpy())
+    return np.stack([vv, vh, vv], axis=-1)
+
+
+def s2_to_rgb_png(t: torch.Tensor) -> np.ndarray:
+    """(4, H, W) S2 DN → HxWx3 uint8 (R, G, B) scaled by max value."""
+    rgb = t[:3].cpu().float().numpy()  # (3, H, W)
+    s2_max = max(rgb.max(), 1e-6)
+    rgb_scaled = np.clip((rgb / s2_max) * 255, 0, 255).astype(np.uint8)
+    return np.transpose(rgb_scaled, (1, 2, 0))
 
 
 def zero_pad(t: torch.Tensor, target: int) -> torch.Tensor:
@@ -102,7 +135,9 @@ def load_trained_weights(model: SRLatentDiffusion, unet_ckpt: str):
 def build_conditioning_s1s2(model: SRLatentDiffusion,
                              aerial_5m: torch.Tensor,
                              s1: torch.Tensor,
-                             s2: torch.Tensor) -> torch.Tensor:
+                             s2: torch.Tensor,
+                             zero_s1: bool = False,
+                             zero_s2: bool = False) -> torch.Tensor:
     """10-channel conditioning for s1s2 variant: VAE(5m aerial)[4] + S1[2] + VAE(S2)[4]."""
     vae = model.model.first_stage_model
     vae_dtype = next(vae.parameters()).dtype
@@ -120,12 +155,18 @@ def build_conditioning_s1s2(model: SRLatentDiffusion,
     s1_norm = normalize_s1(s1, stage="norm")
     cond_s1 = F.interpolate(s1_norm, size=(LATENT_SIZE, LATENT_SIZE), mode="bilinear", align_corners=False)
 
+    if zero_s1:
+        cond_s1.zero_()
+    if zero_s2:
+        cond_s2.zero_()
+
     return torch.cat([cond_5m, cond_s1, cond_s2], dim=1)  # (B, 10, 128, 128)
 
 
 def build_conditioning_s1(model: SRLatentDiffusion,
                            aerial_5m: torch.Tensor,
-                           s1: torch.Tensor) -> torch.Tensor:
+                           s1: torch.Tensor,
+                           zero_s1: bool = False) -> torch.Tensor:
     """6-channel conditioning for s1 variant: VAE(5m aerial)[4] + S1[2]."""
     vae = model.model.first_stage_model
     vae_dtype = next(vae.parameters()).dtype
@@ -138,6 +179,9 @@ def build_conditioning_s1(model: SRLatentDiffusion,
 
     s1_norm = normalize_s1(s1, stage="norm")
     cond_s1 = F.interpolate(s1_norm, size=(LATENT_SIZE, LATENT_SIZE), mode="bilinear", align_corners=False)
+
+    if zero_s1:
+        cond_s1.zero_()
 
     return torch.cat([cond_5m, cond_s1], dim=1)  # (B, 6, 128, 128)
 
@@ -194,12 +238,20 @@ def main():
                         help="Directory with 1m-untouched NPZ tiles (S1+S2+1m aerial)")
     parser.add_argument("--steps_10to5", type=int,   default=100)
     parser.add_argument("--steps_5to1",  type=int,   default=100)
-    parser.add_argument("--guidance_10to5", type=float, default=6.0)
-    parser.add_argument("--guidance_5to1",  type=float, default=6.0)
+    parser.add_argument("--guidance_10to5", type=float, default=1.0)
+    parser.add_argument("--guidance_5to1",  type=float, default=1.0)
     parser.add_argument("--eta",    type=float, default=0.95)
+    parser.add_argument("--zero_s1", action="store_true", default=False,
+                        help="Zero out S1 input (ablation: S2-only conditioning).")
+    parser.add_argument("--zero_s2", action="store_true", default=False,
+                        help="Zero out S2 input (ablation: S1-only conditioning).")
     parser.add_argument("--device", type=str,  default=None)
     parser.add_argument("--out_csv", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for deterministic generation")
     args = parser.parse_args()
+
+    pl.seed_everything(args.seed, workers=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -207,9 +259,33 @@ def main():
     # Stage 1 — 10m→5m
     cfg1 = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_10m.yaml")
     model1 = SRLatentDiffusion(cfg1, device=device)
-    print(f"Loading stage 1 checkpoint: {args.unet_ckpt_10to5}")
+    print("Loading stage 1 (5m UNet, config_10m) ...")
+    model1 = SRLatentDiffusion(cfg1, device=device)
     load_trained_weights(model1, args.unet_ckpt_10to5)
     model1.eval()
+
+    # Patch stage-1 conditioning so ablation flags zero the latent channels after
+    # encoding rather than zeroing the raw pixels
+    if args.zero_s2 or args.zero_s1:
+        _orig_encode = model1._tensor_encode
+        if args.zero_s2 and args.zero_s1:
+            def _patched_encode(X_s2, X_s1):
+                cond = _orig_encode(X_s2, X_s1)
+                cond[:] = 0
+                return cond
+        elif args.zero_s2:
+            def _patched_encode(X_s2, X_s1):
+                cond = _orig_encode(X_s2, X_s1)
+                cond[:, :4] = 0   # zero S2 latent channels, keep S1
+                return cond
+        else:
+            def _patched_encode(X_s2, X_s1):
+                cond = _orig_encode(X_s2, X_s1)
+                cond[:, 4:] = 0   # zero S1 channels, keep S2
+                return cond
+        model1._tensor_encode = _patched_encode
+        ablated = ("S2" if args.zero_s2 else "") + ("S1" if args.zero_s1 else "")
+        print(f"Stage-1 ablation: {ablated} conditioning zeroed after encoding")
 
     # Stage 2 — 5m→1m
     cfg2_name = "config_5m_to_1m_with_s2.yaml" if args.variant == "s1s2" else "config_1m.yaml"
@@ -223,6 +299,15 @@ def main():
     print(f"Found {len(tiles)} tiles in {args.dir_1m}")
 
     offset = (HR_PAD - HR_NATIVE) // 2  # 12px — remove symmetric zero-padding
+
+    images_dir = None
+    out_csv_path = None
+    if args.out_csv:
+        orig_csv = pathlib.Path(args.out_csv)
+        images_dir = orig_csv.parent / orig_csv.stem
+        images_dir.mkdir(parents=True, exist_ok=True)
+        out_csv_path = images_dir / orig_csv.name
+        print(f"Saving per-tile PNGs to {images_dir}")
 
     rows = []
     for path in tqdm(tiles, desc="Evaluating tiles"):
@@ -243,9 +328,9 @@ def main():
 
         # Stage 2: predicted 5m aerial + S1 + S2 → 1m SR (1024×1024)
         if args.variant == "s1s2":
-            cond = build_conditioning_s1s2(model2, aerial_pred, s1, s2)
+            cond = build_conditioning_s1s2(model2, aerial_pred, s1, s2, zero_s1=args.zero_s1, zero_s2=args.zero_s2)
         else:
-            cond = build_conditioning_s1(model2, aerial_pred, s1)
+            cond = build_conditioning_s1(model2, aerial_pred, s1, zero_s1=args.zero_s1)
 
         sr = run_inference(model2, cond,
                            steps=args.steps_5to1, guidance=args.guidance_5to1, eta=args.eta)
@@ -273,6 +358,54 @@ def main():
 
         rows.append(row)
 
+        if images_dir is not None:
+            # Crop padded inputs/intermediates back to native dimensions for the visual tiles
+            s1_native = s1[:, :, 14:14 + 100, 14:14 + 100]
+            aerial_pred_native = aerial_pred[:, :, 28:28 + 200, 28:28 + 200]
+            
+            s2_disp = torch.zeros_like(s2_raw) if args.zero_s2 else s2_raw
+            s1_disp = torch.zeros_like(s1_native) if args.zero_s1 else s1_native
+
+            panels = [
+                ("Sentinel-1 input", s1_to_rgb_png(s1_disp), Image.NEAREST),
+                ("Sentinel-2 input", s2_to_rgb_png(s2_disp), Image.NEAREST),
+                ("5m inferred", aerial_to_rgb_png(aerial_pred_native), Image.BICUBIC),
+                ("1m inferred", aerial_to_rgb_png(sr_crop), Image.NEAREST),
+                ("Ground Truth", aerial_to_rgb_png(aerial_gt), Image.NEAREST),
+            ]
+            H = 1000
+            TEXT_H = 100
+            strip = Image.new("RGB", (H * len(panels), H + TEXT_H), color=(0, 0, 0))
+            draw = ImageDraw.Draw(strip)
+            
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 64)
+            except IOError:
+                try:
+                    font = ImageFont.load_default(size=64)
+                except TypeError:
+                    font = ImageFont.load_default()
+
+            for i, (label, arr, resample) in enumerate(panels):
+                im = Image.fromarray(arr).resize((H, H), resample=resample)
+                strip.paste(im, (i * H, 0))
+                
+                # Measure text to center it under the image
+                try:
+                    left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+                    text_w = right - left
+                    text_h = bottom - top
+                except AttributeError:
+                    text_w, text_h = draw.textsize(label, font=font)
+                
+                # Center text horizontally, and roughly vertically within the TEXT_H band
+                x = i * H + (H - text_w) // 2
+                y = H + (TEXT_H - text_h) // 2 - 10
+                
+                draw.text((x, y), label, fill=(255, 255, 255), font=font)
+                
+            strip.save(images_dir / f"{path.stem}.png")
+
     print("\n" + "=" * 52)
     print(f"  Cascade results  ({len(rows)} tiles, variant={args.variant})")
     print("=" * 52)
@@ -282,13 +415,13 @@ def main():
         print(f"  {METRIC_LABELS[k]:<22}  {mean:8.4f} ± {std:.4f}")
     print("=" * 52)
 
-    if args.out_csv and rows:
-        out = pathlib.Path(args.out_csv)
-        with open(out, "w", newline="") as f:
+    if out_csv_path and rows:
+        with open(out_csv_path, "w", newline="") as f:
+            f.write(f"# command: {shlex.join(sys.argv)}\n")
             writer = csv.DictWriter(f, fieldnames=["tile"] + METRIC_KEYS)
             writer.writeheader()
             writer.writerows(rows)
-        print(f"\nPer-tile results saved to {out}")
+        print(f"\nPer-tile results saved to {out_csv_path}")
 
 
 if __name__ == "__main__":

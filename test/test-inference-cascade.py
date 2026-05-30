@@ -24,6 +24,7 @@ import re
 import sys
 
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
@@ -188,7 +189,11 @@ def main():
                         help="Zero out S2 input (ablation: S1-only conditioning).")
     parser.add_argument("--out_dir",      type=str,   default=str(ROOT / "test" / "results"))
     parser.add_argument("--device",       type=str,   default=None)
+    parser.add_argument("--seed",         type=int,   default=42,
+                        help="Random seed for deterministic generation")
     args = parser.parse_args()
+
+    pl.seed_everything(args.seed, workers=True)
 
     if args.unet_ckpt_5m is None:
         args.unet_ckpt_5m = str(ROOT / "checkpoints" / "5m" / "unet" / "last.ckpt")
