@@ -5,7 +5,7 @@ then scores the reconstruction against the original. This is the upper bound on 
 the latent-diffusion SR pipeline can achieve: any error here is error the diffusion
 model can never recover.
 
-Reports mean +/- std of PSNR, SSIM, MAE and writes a per-tile CSV, mirroring the
+Reports mean +/- std of PSNR and SSIM and writes a per-tile CSV, mirroring the
 output format of test/eval.py.
 
 IMPORTANT: feed each VAE the spatial size it was TRAINED on, via --pad_size. A VAE is
@@ -125,7 +125,7 @@ def crop_pad(x: torch.Tensor, pad) -> torch.Tensor:
     return x[..., t:(H - b) if b else H, l:(W - r) if r else W]
 
 
-def save_comparison(hr_u8, sr_u8, name, psnr, mae, out_dir):
+def save_comparison(hr_u8, sr_u8, name, out_dir):
     """Save an 'Original | Reconstruction' RGB side-by-side PNG."""
     import matplotlib
     matplotlib.use("Agg")
@@ -202,8 +202,6 @@ def main():
         recon = crop_pad(recon_p, pad)                      # native content, [-1, 1]
 
         x = normalize_aerial(aerial, stage="norm")          # native content, [-1, 1]
-        # MAE in [-1, 1] space (matches ae-test.py and the backup/ filename convention)
-        mae = torch.mean(torch.abs(x - recon)).item()
 
         # PSNR/SSIM on RGB [0, 255] (matches test/eval.py)
         hr_u8 = normalize_aerial(x, stage="denorm")[0, :3].cpu().numpy().transpose(1, 2, 0).clip(0, 255).astype(np.uint8)
@@ -211,22 +209,24 @@ def main():
         psnr = peak_signal_noise_ratio(hr_u8, sr_u8, data_range=255)
         ssim = structural_similarity(hr_u8, sr_u8, channel_axis=2, data_range=255)
 
-        rows.append({"tile": name, "psnr": float(psnr), "ssim": float(ssim), "mae": float(mae)})
+        rows.append({"tile": name, "psnr": float(psnr), "ssim": float(ssim)})
 
         if args.save_visual:
-            save_comparison(hr_u8, sr_u8, name, psnr, mae, visuals_dir)
+            save_comparison(hr_u8, sr_u8, name, visuals_dir)
 
     # Aggregate mean / std once so the CSV summary rows and the stdout print can't drift.
-    agg = {k: np.array([r[k] for r in rows], dtype=np.float64) for k in ("psnr", "ssim", "mae")}
+    agg = {k: np.array([r[k] for r in rows], dtype=np.float64) for k in ("psnr", "ssim")}
     mean_row = {"tile": "mean", **{k: float(v.mean()) for k, v in agg.items()}}
     std_row  = {"tile": "std",  **{k: float(v.std())  for k, v in agg.items()}}
 
     # Save per-tile CSV under a per-VAE subdir
     out_csv = run_dir / "metrics.csv"
     cmd_line = "python " + shlex.join(sys.argv)
+    pad_str = args.pad_size if args.pad_size else "auto"
     with open(out_csv, "w", newline="") as f:
         f.write(f"# {cmd_line}\n")
-        writer = csv.DictWriter(f, fieldnames=["tile", "psnr", "ssim", "mae"])
+        f.write(f"# effective: pad_size={pad_str} tiles={len(rows)}\n")
+        writer = csv.DictWriter(f, fieldnames=["tile", "psnr", "ssim"])
         writer.writeheader()
         writer.writerows(rows)
         writer.writerow(mean_row)
@@ -234,7 +234,7 @@ def main():
 
     # Summary
     print(f"\n  VAE reconstruction over {len(rows)} tiles")
-    for k, label in [("psnr", "PSNR ↑"), ("ssim", "SSIM ↑"), ("mae", "MAE ↓")]:
+    for k, label in [("psnr", "PSNR ↑"), ("ssim", "SSIM ↑")]:
         print(f"  {label:<10}  {mean_row[k]:8.4f} ± {std_row[k]:.4f}")
     print(f"\nPer-tile results saved to {out_csv}")
 

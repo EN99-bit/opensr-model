@@ -36,7 +36,9 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
+from skimage.metrics import structural_similarity, peak_signal_noise_ratio
 from tqdm import tqdm
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -46,12 +48,55 @@ sys.path.insert(0, str(ROOT / "test"))
 # Reuse eval_cfg's scoring + plotting so both diagnostics stay consistent.
 import eval_cfg
 from eval_cfg import (
-    score_batch, save_one_curve, save_tile_grid, resolve_run_dir,
-    METRIC_COLS, PANEL_METRICS_FULL, PANEL_METRICS_PIXEL,
+    score_batch, save_metric_plots, save_tile_grid, resolve_run_dir,
+    lpips_score, to_rgb_u8_norm, METRIC_COLS, OPENSR_METRICS,
+    PANEL_METRICS_FULL, PANEL_METRICS_PIXEL,
 )
 from opensr_model.srmodel import SRLatentDiffusion
 from opensr_model.data import FusionDataset
+from opensr_model.utils import normalize_s2
 from eval import load_trained_weights
+
+
+def bicubic_baseline(samples, device, no_opensr=False):
+    """'No-model' floor (plotted at x=0): bicubic-upsample the S2 input to the aerial
+    resolution and score it against the GT aerial with the same metrics. Returns
+    (per-tile metric dicts, RGB thumbs). Same LR-upsample workaround as score_batch.
+    """
+    results, thumbs = [], []
+    for s in samples:
+        s2 = s["s2"].to(device).float()
+        aerial = s["aerial"].to(device).float()
+        H = aerial.shape[-1]
+        lr_norm = (normalize_s2(s2, stage="norm") + 1.0) / 2.0
+        sr_norm = F.interpolate(lr_norm.unsqueeze(0), size=(H, H),
+                                mode="bicubic", align_corners=False).clamp(0, 1)[0]
+        hr_norm = (aerial / 255.0).clamp(0, 1)
+        out = {}
+        if no_opensr or getattr(eval_cfg, "opensr_test", None) is None:
+            for k in OPENSR_METRICS:
+                out[k] = float("nan")
+        else:
+            try:
+                lr_eval = lr_norm
+                if hr_norm.shape[-1] / lr_norm.shape[-1] > 4:
+                    t = hr_norm.shape[-1] // 4
+                    lr_eval = F.interpolate(lr_norm.unsqueeze(0), size=(t, t),
+                                            mode="bilinear", align_corners=False)[0]
+                r = eval_cfg.opensr_test.Metrics().compute(lr=lr_eval, sr=sr_norm, hr=hr_norm)
+                for k in OPENSR_METRICS:
+                    out[k] = float(r.get(k, float("nan")))
+            except Exception:
+                for k in OPENSR_METRICS:
+                    out[k] = float("nan")
+        hr_u8 = to_rgb_u8_norm(hr_norm)
+        sr_u8 = to_rgb_u8_norm(sr_norm)
+        out["psnr"] = float(peak_signal_noise_ratio(hr_u8, sr_u8, data_range=255))
+        out["ssim"] = float(structural_similarity(hr_u8, sr_u8, channel_axis=2, data_range=255))
+        out["lpips"] = lpips_score(sr_norm, hr_norm, device)
+        results.append(out)
+        thumbs.append(sr_u8)
+    return results, thumbs
 
 
 def aggregate_steps(rows, steps_list):
@@ -117,6 +162,13 @@ def run_eval_loop(args, steps_list, shard_idx=0, shard_count=1):
                 for name, thumb in zip(names, batch_thumbs):
                     tile_srs.setdefault(name, {})[steps] = thumb
 
+        # Bicubic 'no-model' floor: plotted at x=0 (steps=0) and shown as a grid panel.
+        b_results, b_thumbs = bicubic_baseline(samples, device, no_opensr=args.no_opensr_test)
+        b_thumb_by_name = {}
+        for name, m, th in zip(names, b_results, b_thumbs):
+            rows.append({"tile": name, "steps": 0, **{k: m[k] for k in METRIC_COLS}})
+            b_thumb_by_name[name] = th
+
         if tile_srs is not None:
             for sample in samples:
                 name = pathlib.Path(sample["path"]).stem
@@ -125,7 +177,8 @@ def run_eval_loop(args, steps_list, shard_idx=0, shard_count=1):
                 if name in tile_srs:
                     out_path = images_dir / f"{name}_steps.png"
                     save_tile_grid(name, hr_rgb, tile_srs[name], mode_label, out_path,
-                                   label_fmt="{:g} steps")
+                                   label_fmt="{:g} steps",
+                                   extra_panels=[("Bicubic", b_thumb_by_name[name])])
     return rows
 
 
@@ -200,6 +253,8 @@ def run_multi_gpu(args, steps_list, n_devices):
 
 
 def write_outputs(args, rows, run_dir, steps_list, stage, cmd_line):
+    # Derive the axis from the rows so the bicubic floor (steps=0) is included.
+    steps_list = sorted({int(r["steps"]) for r in rows})
     agg = aggregate_steps(rows, steps_list)
     n_tiles = len({r["tile"] for r in rows})
     panel_metrics = PANEL_METRICS_PIXEL if args.no_opensr_test else PANEL_METRICS_FULL
@@ -237,17 +292,15 @@ def write_outputs(args, rows, run_dir, steps_list, stage, cmd_line):
     print(f"\nPer-(tile, steps) results saved to {out_csv}")
 
     if args.save_plot:
-        ref = max(steps_list)   # treat the highest step count as the converged reference
-        plot_path = run_dir / "curve_steps.png"
-        title = (f"Effekt af antal sampling-steps på {stage} UNet"
-                 if stage else "Effekt af antal sampling-steps")
-        save_one_curve(
-            agg, steps_list, plot_path, title, "Sampling steps",
-            baseline_x=ref, panel_metrics=panel_metrics,
-            baseline_label=f"Reference ({ref} steps)",
-            baseline_ref_label=f"{ref} steps",
-        )
-        print(f"Plot saved to {plot_path}")
+        # One plot file per metric in steps_plots/. The dashed reference is the bicubic
+        # 'no-model' floor (steps=0); the curve covers the actual step counts (>0).
+        curve_steps = [s for s in steps_list if s > 0]
+        metrics_to_plot = (["psnr", "ssim", "lpips"]
+                           if args.no_opensr_test else METRIC_COLS)
+        plots_dir = run_dir / "steps_plots"
+        save_metric_plots(agg, curve_steps, plots_dir, "Sampling steps", metrics_to_plot,
+                          baseline_x=0, baseline_label="Bicubic (ingen model)")
+        print(f"Per-metric plots saved to {plots_dir}/ ({len(metrics_to_plot)} metrics)")
 
 
 def main():
@@ -261,8 +314,10 @@ def main():
     parser.add_argument("--pad_size", type=int, required=True,
                         help="VAE training size (1024 for 1m, 256 for 5m). "
                              "Informational — model.forward handles padding internally.")
-    parser.add_argument("--steps", default="10,25,50,75,100,250,500",
-                        help="Comma-separated DDIM step counts to sweep.")
+    parser.add_argument("--steps", default="1,2,5,10,20,25,50,100",
+                        help="Comma-separated DDIM step counts to sweep. Prefer counts that "
+                             "divide 1000 evenly (1,5,10,20,25,50,100,...) — others (e.g. 75) hit "
+                             "a schedule-length/index mismatch in forward and diverge.")
     parser.add_argument("--gs", type=float, default=1.0,
                         help="Fixed guidance held constant across the sweep. With --cfgpp "
                              "this is λ∈(0,1]; otherwise it is the CFG scale (≥1).")

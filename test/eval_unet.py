@@ -56,10 +56,26 @@ sys.path.insert(0, str(ROOT))
 
 from opensr_model.srmodel import SRLatentDiffusion
 from opensr_model.data import FusionDataset, LR_PAD_SIZE
-from opensr_model.utils import normalize_aerial
+from opensr_model.utils import normalize_aerial, normalize_s2, normalize_s1
 
 # Reuse eval.py's UNet-weight loader (handles the 'ldm.' prefix strip; VAE bundled in ckpt)
 from eval import load_trained_weights
+
+# Reuse eval_cfg's plotting + metric set so this diagnostic matches the CFG sweep layout.
+sys.path.insert(0, str(ROOT / "test"))
+from eval_cfg import (
+    save_metric_plots, save_tile_grid, lpips_score, OPENSR_METRICS, OM_HA_PANEL,
+    PANEL_METRICS_FULL, PANEL_METRICS_PIXEL,
+)
+
+try:
+    import opensr_test
+except ImportError:
+    opensr_test = None
+
+# Per-tile metrics: pixel fidelity (incl. MAE), perceptual (LPIPS),
+# and the opensr_test suite (om/ha/im, etc.).
+UNET_METRICS = ["psnr", "ssim", "lpips", "mae", *OPENSR_METRICS]
 
 
 def pad_to_size(x: torch.Tensor, size: int):
@@ -94,39 +110,33 @@ def predict_x0(model, z_t, t_int, cond, a_bar_t):
     return (z_t - sqrt_1ma * eps_hat) / sqrt_a
 
 
+AERIAL_KEYS = ("aerial_r", "aerial_g", "aerial_b", "aerial_nir")
+AERIAL_5M_PAD = 256   # 5m aerial: 200×200 native → 256 (matches training)
+
+
+def build_cond_5m_s1(model, aerial_5m, s1, pad_size):
+    """Cascade stage-2 conditioning, matching train_unet_5-1_with_s1._build_conditioning:
+    VAE(5m aerial upsampled to pad_size)[4ch] + S1[2ch] = 6ch.
+
+    `aerial_5m` is (B,4,256,256) in [0,255]; `s1` is (B,2,128,128). Uses the VAE
+    posterior mode() (deterministic) rather than sample(), since this is an oracle.
+    """
+    vae = model.model.first_stage_model
+    vae_dtype = next(vae.parameters()).dtype
+    latent = pad_size // model.vae_downscale
+    aerial_up = F.interpolate(normalize_aerial(aerial_5m, stage="norm"),
+                              size=(pad_size, pad_size), mode="bilinear", align_corners=False)
+    with torch.no_grad():
+        cond_5m = vae.encode(aerial_up.to(vae_dtype)).mode().float()
+    cond_s1 = F.interpolate(normalize_s1(s1, stage="norm"),
+                            size=(latent, latent), mode="bilinear", align_corners=False)
+    return torch.cat([cond_5m, cond_s1], dim=1)
+
+
 def to_rgb_u8(img_norm):
     """[-1,1] (1,4,H,W) tensor -> RGB uint8 (H,W,3) for skimage metrics."""
     arr = normalize_aerial(img_norm, stage="denorm")[0, :3].cpu().numpy().transpose(1, 2, 0)
     return arr.clip(0, 255).astype(np.uint8)
-
-
-def save_curve(per_t_stats, out_path, title):
-    """Line plot: mean PSNR vs t-fraction with ±std band."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fracs = sorted(per_t_stats.keys())
-    psnr_mean = [per_t_stats[f]["psnr_mean"] for f in fracs]
-    psnr_std = [per_t_stats[f]["psnr_std"] for f in fracs]
-
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(fracs, psnr_mean, marker="o", lw=2, label="Gennemsnit af testbilleder")
-    ax.legend(loc="upper right", frameon=True)
-    ax.set_xlabel("Støjniveau (t / T)")
-    ax.set_ylabel("PSNR ↑")
-    ax.set_title(title)
-    ax.grid(alpha=0.3)
-
-    # Axis-break marks on the y-axis (╱╱) — signals that the y-axis does not start at 0.
-    d = 0.015
-    kw = dict(transform=ax.transAxes, color="k", lw=1, clip_on=False)
-    ax.plot([-d, +d], [0.03 - d, 0.03 + d], **kw)
-    ax.plot([-d, +d], [0.06 - d, 0.06 + d], **kw)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
 
 
 def resolve_run_dir(args):
@@ -183,6 +193,24 @@ def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
     tile_indices = list(range(shard_idx, n_total, shard_count))
     print(f"{tag} Evaluating {len(tile_indices)} of {n_total} tiles at t-fractions {t_fracs}")
 
+    # Cascade stage-2 (5to1m) models condition on the 5m aerial, not S2. When a 5m
+    # tile dir is given, build conditioning from the paired 5m aerial + S1 (matching
+    # training); otherwise use the model's default S2+S1 encoding.
+    cond_5m_map = None
+    if getattr(args, "cond_5m_dir", None):
+        cond_5m_map = {p.stem: p for p in sorted(pathlib.Path(args.cond_5m_dir).glob("*.npz"))}
+        if not cond_5m_map:
+            print(f"No .npz tiles in --cond_5m_dir {args.cond_5m_dir}")
+            return [], int(OmegaConf.load(args.config).denoiser_settings.timesteps)
+        print(f"{tag} Cascade conditioning: VAE(5m aerial)+S1 from {args.cond_5m_dir} "
+              f"({len(cond_5m_map)} tiles)")
+
+    save_images = getattr(args, "save_images", False)
+    if save_images:
+        images_dir, _ = resolve_run_dir(args)
+        images_dir = images_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+
     # Only shard 0 shows the progress bar to avoid 4 interleaved tqdm streams.
     show_progress = (shard_idx == 0)
     rows = []
@@ -200,7 +228,21 @@ def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
             z_0 = encode_target(model, x_norm)
             s2_p, _ = pad_to_size(s2, LR_PAD_SIZE)
             s1_p, _ = pad_to_size(s1, LR_PAD_SIZE)
-            cond = model._tensor_encode(s2_p, s1_p)
+            if cond_5m_map is not None:
+                # Build cascade conditioning from the paired 5m aerial + S1.
+                p5 = cond_5m_map.get(name)
+                if p5 is None:
+                    if show_progress:
+                        print(f"  [skip] no 5m tile for {name}")
+                    continue
+                with np.load(p5, allow_pickle=True) as d5:
+                    aerial_5m = torch.from_numpy(
+                        np.stack([d5[k].astype(np.float32) for k in AERIAL_KEYS])
+                    ).unsqueeze(0).to(device)
+                aerial_5m, _ = pad_to_size(aerial_5m, AERIAL_5M_PAD)
+                cond = build_cond_5m_s1(model, aerial_5m, s1_p, args.pad_size)
+            else:
+                cond = model._tensor_encode(s2_p, s1_p)
             assert z_0.shape[-2:] == cond.shape[-2:], (
                 f"latent/cond spatial mismatch {z_0.shape} vs {cond.shape}"
             )
@@ -208,6 +250,19 @@ def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
             gi = torch.Generator(device="cpu").manual_seed(args.seed + i)
             eps = torch.randn(z_0.shape, generator=gi).to(device)
 
+            # Reference tensors for perceptual (LPIPS) + opensr_test scoring.
+            # HR is constant per tile; the S2 LR is the opensr_test reference
+            # (satalign breaks for scale > 4, so upsample LR to keep scale ≤ 4).
+            hr_norm = (aerial[0] / 255.0).clamp(0, 1)
+            run_opensr = (opensr_test is not None) and (not getattr(args, "no_opensr_test", False))
+            if run_opensr:
+                lr_eval = (normalize_s2(s2[0].float(), stage="norm") + 1.0) / 2.0
+                if hr_norm.shape[-1] / lr_eval.shape[-1] > 4:
+                    tgt = hr_norm.shape[-1] // 4
+                    lr_eval = F.interpolate(lr_eval.unsqueeze(0), size=(tgt, tgt),
+                                            mode="bilinear", align_corners=False)[0]
+
+            tile_thumbs = {} if save_images else None
             for frac in t_fracs:
                 t_int = max(0, min(T - 1, int(round(frac * (T - 1)))))
                 a_bar_t = model.model.alphas_cumprod[t_int].to(device)
@@ -221,29 +276,47 @@ def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
                 mae = torch.mean(torch.abs(x_native - img_hat_n)).item()
                 hr_u8 = to_rgb_u8(x_native)
                 sr_u8 = to_rgb_u8(img_hat_n)
+                if tile_thumbs is not None:
+                    tile_thumbs[frac] = sr_u8
                 psnr = peak_signal_noise_ratio(hr_u8, sr_u8, data_range=255)
                 ssim = structural_similarity(hr_u8, sr_u8, channel_axis=2, data_range=255)
 
-                rows.append({
-                    "tile": name, "t_frac": frac, "t": t_int,
-                    "psnr": float(psnr), "ssim": float(ssim), "mae": float(mae),
-                })
+                sr_norm = (normalize_aerial(img_hat_n, stage="denorm")[0] / 255.0).clamp(0, 1)
+                row = {"tile": name, "t_frac": frac, "t": t_int,
+                       "psnr": float(psnr), "ssim": float(ssim), "mae": float(mae),
+                       "lpips": lpips_score(sr_norm, hr_norm, device)}
+                if run_opensr:
+                    try:
+                        r = opensr_test.Metrics().compute(lr=lr_eval, sr=sr_norm, hr=hr_norm)
+                        for k in OPENSR_METRICS:
+                            row[k] = float(r.get(k, float("nan")))
+                    except Exception as e:
+                        if show_progress:
+                            print(f"  opensr_test failed (tile={name}, t={t_int}): {e}")
+                        for k in OPENSR_METRICS:
+                            row[k] = float("nan")
+                else:
+                    for k in OPENSR_METRICS:
+                        row[k] = float("nan")
+                rows.append(row)
+
+            if tile_thumbs is not None:
+                save_tile_grid(name, hr_u8, tile_thumbs, "UNet-orakel", images_dir / f"{name}.png",
+                               label_fmt="t/T={:g}")
 
     return rows, T
 
 
 def aggregate_per_t(rows, t_fracs):
+    """{t_frac: {metric: (mean, std)}} across tiles — same shape save_one_curve expects."""
     per_t = {}
     for frac in t_fracs:
         sel = [r for r in rows if r["t_frac"] == frac]
-        psnr = np.array([r["psnr"] for r in sel])
-        ssim = np.array([r["ssim"] for r in sel])
-        mae = np.array([r["mae"] for r in sel])
-        per_t[frac] = {
-            "psnr_mean": float(psnr.mean()), "psnr_std": float(psnr.std()),
-            "ssim_mean": float(ssim.mean()), "ssim_std": float(ssim.std()),
-            "mae_mean":  float(mae.mean()),  "mae_std":  float(mae.std()),
-        }
+        per_t[frac] = {}
+        for k in UNET_METRICS:
+            v = np.array([r[k] for r in sel], dtype=np.float64)
+            v = v[~np.isnan(v)]
+            per_t[frac][k] = (float(v.mean()), float(v.std())) if len(v) else (float("nan"), float("nan"))
     return per_t
 
 
@@ -252,44 +325,49 @@ def write_final_outputs(args, rows, run_dir, t_fracs, T, stage, cmd_line):
     print the summary, and optionally save the PSNR-vs-t plot."""
     per_t = aggregate_per_t(rows, t_fracs)
     n_tiles = len({r["tile"] for r in rows})
+    no_opensr = getattr(args, "no_opensr_test", False)
 
     out_csv = run_dir / "metrics.csv"
+    fields = ["tile", "t_frac", "t", *UNET_METRICS]
     with open(out_csv, "w", newline="") as f:
         f.write(f"# {cmd_line}\n")
-        writer = csv.DictWriter(f, fieldnames=["tile", "t_frac", "t", "psnr", "ssim", "mae"])
+        f.write(f"# effective: seed={args.seed} opensr_test={'off' if no_opensr else 'on'}\n")
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
         for frac in t_fracs:
-            s = per_t[frac]
-            writer.writerow({"tile": f"mean_t={frac}", "t_frac": frac, "t": "",
-                             "psnr": s["psnr_mean"], "ssim": s["ssim_mean"], "mae": s["mae_mean"]})
-            writer.writerow({"tile": f"std_t={frac}",  "t_frac": frac, "t": "",
-                             "psnr": s["psnr_std"],  "ssim": s["ssim_std"],  "mae": s["mae_std"]})
+            t_int = max(0, min(T - 1, int(round(frac * (T - 1)))))
+            writer.writerow({"tile": f"mean_t={frac}", "t_frac": frac, "t": t_int,
+                             **{k: per_t[frac][k][0] for k in UNET_METRICS}})
+            writer.writerow({"tile": f"std_t={frac}", "t_frac": frac, "t": t_int,
+                             **{k: per_t[frac][k][1] for k in UNET_METRICS}})
 
+    table_keys = ["psnr", "ssim", "lpips", "mae"] + ([] if no_opensr else ["im_metric", "ha_metric", "om_metric"])
     print(f"\n  UNet oracle reconstruction over {n_tiles} tiles  (eps-pred, seed={args.seed})")
-    print(f"  {'t/T':>5}  {'t':>4}  {'PSNR':>14}  {'SSIM':>14}  {'MAE':>14}")
+    print(f"  {'t/T':>5}  {'t':>4}  " + "  ".join(f"{k:>10}" for k in table_keys))
     for frac in t_fracs:
-        s = per_t[frac]
         t_int = max(0, min(T - 1, int(round(frac * (T - 1)))))
-        print(f"  {frac:>5.2f}  {t_int:>4d}  "
-              f"{s['psnr_mean']:7.3f} ± {s['psnr_std']:5.3f}  "
-              f"{s['ssim_mean']:7.4f} ± {s['ssim_std']:5.4f}  "
-              f"{s['mae_mean']:7.4f} ± {s['mae_std']:5.4f}")
+        vals = "  ".join(f"{per_t[frac][k][0]:10.4f}" for k in table_keys)
+        print(f"  {frac:>5.2f}  {t_int:>4d}  {vals}")
     print(f"\nPer-tile-per-t results saved to {out_csv}")
 
     if args.save_plot:
-        plot_path = run_dir / "curve.png"
-        title = (f"Kvalitet af {stage} UNet vs Støjniveau (t / T)"
-                 if stage else "Kvalitet af UNet vs Støjniveau (t / T)")
-        save_curve(per_t, plot_path, title)
-        print(f"Plot saved to {plot_path}")
+        # One plot file per metric in oracle_plots/. No baseline — noise level
+        # has no "no-guidance" reference point.
+        metrics_to_plot = (["psnr", "ssim", "lpips", "mae"]
+                           if no_opensr else UNET_METRICS)
+        plots_dir = run_dir / "oracle_plots"
+        save_metric_plots(per_t, t_fracs, plots_dir, "Støjniveau (t / T)",
+                          metrics_to_plot, baseline_x=None)
+        print(f"Per-metric plots saved to {plots_dir}/ ({len(metrics_to_plot)} metrics)")
 
 
 def write_shard_csv(rows, run_dir, shard_idx):
     """Per-shard partial CSV (no command line, no aggregates). Merged by the parent."""
     out = run_dir / f"metrics.shard{shard_idx}.csv"
+    fields = ["tile", "t_frac", "t", *UNET_METRICS]
     with open(out, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["tile", "t_frac", "t", "psnr", "ssim", "mae"])
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
     print(f"[shard {shard_idx}] wrote {out} ({len(rows)} rows)")
@@ -299,14 +377,10 @@ def read_shard_csv(path):
     rows = []
     with open(path) as f:
         for r in csv.DictReader(f):
-            rows.append({
-                "tile": r["tile"],
-                "t_frac": float(r["t_frac"]),
-                "t": int(r["t"]),
-                "psnr": float(r["psnr"]),
-                "ssim": float(r["ssim"]),
-                "mae": float(r["mae"]),
-            })
+            row = {"tile": r["tile"], "t_frac": float(r["t_frac"]), "t": int(r["t"])}
+            for k in UNET_METRICS:
+                row[k] = float(r[k])
+            rows.append(row)
     return rows
 
 
@@ -332,6 +406,12 @@ def run_multi_gpu(args, t_fracs, n_devices):
                "--device", "cuda:0"]  # masked by CUDA_VISIBLE_DEVICES below
         if args.max_tiles is not None:
             cmd += ["--max_tiles", str(args.max_tiles)]
+        if args.no_opensr_test:
+            cmd += ["--no_opensr_test"]
+        if args.save_images:
+            cmd += ["--save_images"]
+        if args.cond_5m_dir:
+            cmd += ["--cond_5m_dir", args.cond_5m_dir]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(i)
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -363,12 +443,22 @@ def main():
                              "(1m: config_1m.yaml; 5m: config_10m.yaml)")
     parser.add_argument("--pad_size", type=int, required=True,
                         help="Zero-pad aerial tiles to this size (1024 for 1m, 256 for 5m).")
+    parser.add_argument("--cond_5m_dir", type=str, default=None,
+                        help="For cascade stage-2 (5to1m) models: directory of 5m NPZ tiles. "
+                             "Conditioning is then VAE(5m aerial)+S1 (matching training) instead "
+                             "of the default S2+S1. Tiles are paired with --npz_dir by filename stem.")
     parser.add_argument("--t_fracs", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
                         help="Comma-separated fractions of T to test (each in (0,1))")
     parser.add_argument("--out_dir", default=str(ROOT / "test" / "results" / "unet-oracle"))
     parser.add_argument("--max_tiles", type=int, default=None)
     parser.add_argument("--save_plot", action="store_true",
-                        help="Save the PSNR-vs-t line plot as curve.png")
+                        help="Save per-metric plots into oracle_plots/")
+    parser.add_argument("--save_images", action="store_true",
+                        help="Save a per-tile grid (Original + reconstruction@each t/T) "
+                             "under <run_dir>/images/.")
+    parser.add_argument("--no_opensr_test", action="store_true",
+                        help="Skip the opensr_test metrics (reflectance/spectral/om/ha/im); "
+                             "plot then shows only PSNR + SSIM.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--devices", type=int,

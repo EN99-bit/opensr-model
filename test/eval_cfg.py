@@ -69,25 +69,76 @@ from eval import load_trained_weights
 # opensr_test produces these in addition to our PSNR/SSIM.
 OPENSR_METRICS = ["reflectance", "spectral", "spatial", "synthesis",
                   "ha_metric", "om_metric", "im_metric"]
-METRIC_COLS = ["psnr", "ssim", *OPENSR_METRICS]
+METRIC_COLS = ["psnr", "ssim", "lpips", *OPENSR_METRICS]
 
 # Sentinel panel key: render om_metric + ha_metric together on one shared y-axis.
 OM_HA_PANEL = "om_ha_panel"
 HA_COLOR = "tab:blue"
 OM_COLOR = "tab:orange"
 
-# Plot panels (subset chosen to tell the CFG tradeoff story).
+# Plot panels — a 3×2 overview spanning every axis that matters:
+#   distortion (PSNR, SSIM), opensr fidelity (Improvement + the omission/hallucination
+#   decomposition), perceptual structure (LPIPS), and colour/spectral fidelity (Spectral).
+# Spectral is the metric that tracks visible desaturation, which LPIPS is largely blind to.
+# (reflectance moves with spectral but ~50× smaller, so it stays in the CSV only.)
 PANEL_METRICS_FULL = [
     ("psnr",        "PSNR ↑"),
     ("ssim",        "SSIM ↑"),
     ("im_metric",   "Improvement ↑"),
     (OM_HA_PANEL,   "Omission vs. Hallucination"),
+    ("lpips",       "LPIPS ↓"),
+    ("spectral",    "Spectral ↓"),
 ]
 # Used when opensr_test is skipped (e.g. on the 1m stage where its 10× geometry breaks).
 PANEL_METRICS_PIXEL = [
     ("psnr", "PSNR ↑"),
     ("ssim", "SSIM ↑"),
 ]
+
+# Axis label (with ↑/↓ direction) for every metric — used when each metric is
+# saved as its own plot file.
+METRIC_LABELS = {
+    "psnr":        "PSNR ↑",
+    "ssim":        "SSIM ↑",
+    "lpips":       "LPIPS ↓",
+    "reflectance": "Reflectance ↓",
+    "spectral":    "Spectral ↓",
+    "spatial":     "Spatial ↓",
+    "synthesis":   "Synthesis ↑",
+    "ha_metric":   "Hallucination ↓",
+    "om_metric":   "Omission ↓",
+    "im_metric":   "Improvement ↑",
+    "mae":         "MAE ↓",
+}
+
+
+# ── Perceptual metric (LPIPS) ───────────────────────────────────────────────
+_LPIPS_MODEL = None  # cached singleton; set to False if the package is unavailable
+
+
+def lpips_score(sr_norm, hr_norm, device):
+    """LPIPS (VGG) between SR and HR, RGB only. Inputs (C,H,W) in [0,1]; lower = better.
+
+    Builds the model once and caches it. Returns NaN if `lpips` cannot be loaded,
+    so a missing dependency degrades to a NaN column rather than crashing the run.
+    """
+    global _LPIPS_MODEL
+    if _LPIPS_MODEL is False:
+        return float("nan")
+    if _LPIPS_MODEL is None:
+        try:
+            import lpips
+            _LPIPS_MODEL = lpips.LPIPS(net="vgg").to(device).eval()
+            for p in _LPIPS_MODEL.parameters():
+                p.requires_grad = False
+        except Exception as e:
+            print(f"  LPIPS unavailable ({e}); reporting NaN for lpips.")
+            _LPIPS_MODEL = False
+            return float("nan")
+    sr = sr_norm[:3].unsqueeze(0).to(device) * 2.0 - 1.0
+    hr = hr_norm[:3].unsqueeze(0).to(device) * 2.0 - 1.0
+    with torch.no_grad():
+        return float(_LPIPS_MODEL(sr, hr).item())
 
 
 def pad_to_size(x: torch.Tensor, size: int):
@@ -183,6 +234,7 @@ def score_batch(model, samples, args, gs, cfg_pp):
         sr_u8 = to_rgb_u8_norm(sr_norm)
         out["psnr"] = float(peak_signal_noise_ratio(hr_u8, sr_u8, data_range=255))
         out["ssim"] = float(structural_similarity(hr_u8, sr_u8, channel_axis=2, data_range=255))
+        out["lpips"] = lpips_score(sr_norm, hr_norm, device)
         results.append(out)
         sr_thumbs.append(sr_u8)
     return results, sr_thumbs
@@ -213,19 +265,22 @@ def resolve_run_dir(args):
     return run_dir, display_stage
 
 
-def save_tile_grid(tile_name, hr_rgb, gs_to_sr_rgb, mode_label, out_path, label_fmt="gs={:g}"):
-    """Square-ish grid: Original + SR@gs_1, SR@gs_2, … laid out near-square.
+def save_tile_grid(tile_name, hr_rgb, gs_to_sr_rgb, mode_label, out_path,
+                   label_fmt="gs={:g}", extra_panels=None):
+    """Square-ish grid: Original + [extra reference panels] + SR@gs_1, SR@gs_2, …
 
-    Picks `ncols = ceil(sqrt(n_panels))` and `nrows = ceil(n / ncols)`, so for the
-    default 8-value sweep (= 9 panels total) you get a clean 3×3.
+    `extra_panels` is an optional list of (title, rgb_uint8) inserted right after
+    Original — e.g. the CFG gs=1 baseline reconstruction on a CFG++ grid.
+    Picks `ncols = ceil(sqrt(n_panels))` and `nrows = ceil(n / ncols)`.
     """
     import math
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    extra_panels = extra_panels or []
     gs_sorted = sorted(gs_to_sr_rgb.keys())
-    n_panels = 1 + len(gs_sorted)
+    n_panels = 1 + len(extra_panels) + len(gs_sorted)
     ncols = math.ceil(math.sqrt(n_panels))
     nrows = math.ceil(n_panels / ncols)
 
@@ -236,10 +291,17 @@ def save_tile_grid(tile_name, hr_rgb, gs_to_sr_rgb, mode_label, out_path, label_
     axes_flat[0].imshow(hr_rgb)
     axes_flat[0].set_title("Original")
     axes_flat[0].axis("off")
-    for i, gs in enumerate(gs_sorted):
-        axes_flat[i + 1].imshow(gs_to_sr_rgb[gs])
-        axes_flat[i + 1].set_title(label_fmt.format(gs))
-        axes_flat[i + 1].axis("off")
+    idx = 1
+    for title, rgb in extra_panels:
+        axes_flat[idx].imshow(rgb)
+        axes_flat[idx].set_title(title)
+        axes_flat[idx].axis("off")
+        idx += 1
+    for gs in gs_sorted:
+        axes_flat[idx].imshow(gs_to_sr_rgb[gs])
+        axes_flat[idx].set_title(label_fmt.format(gs))
+        axes_flat[idx].axis("off")
+        idx += 1
     # Hide any leftover cells (when n_panels < nrows × ncols).
     for ax in axes_flat[n_panels:]:
         ax.set_visible(False)
@@ -319,7 +381,15 @@ def run_eval_loop(args, sweeps, shard_idx=0, shard_count=1):
                     mode_label = "CFG++" if cp == 1 else "CFG"
                     mode_tag = "cfgpp" if cp == 1 else "cfg"
                     out_path = images_dir / f"{name}_{mode_tag}.png"
-                    save_tile_grid(name, hr_rgb, tile_srs[key], mode_label, out_path)
+                    # On the CFG++ grid, show the plain-conditional CFG gs=1 output as
+                    # a reference panel (right after Original), if it was computed.
+                    extra = None
+                    if cp == 1:
+                        base_thumb = tile_srs.get((name, 0), {}).get(1.0)
+                        if base_thumb is not None:
+                            extra = [("CFG gs=1 (baseline)", base_thumb)]
+                    save_tile_grid(name, hr_rgb, tile_srs[key], mode_label, out_path,
+                                   extra_panels=extra)
 
     return rows
 
@@ -385,6 +455,59 @@ def _draw_om_ha_panel(ax, agg_mode, gs_list, x_label,
     ax.legend(handles=handles, loc="upper center", ncol=2,
               frameon=True, framealpha=0.9, fontsize=8)
 
+    # // break marks — the y-axis does not start at 0 (matches the other panels).
+    if ax.get_ylim()[0] > 0:
+        d = 0.015
+        kwargs = dict(transform=ax.transAxes, color="black", clip_on=False, lw=1.5)
+        ax.plot((-d, d), (-d, d), **kwargs)
+        ax.plot((-d, d), (-d + 0.02, d + 0.02), **kwargs)
+
+
+def save_metric_plots(agg_mode, x_list, out_dir, x_label, metrics,
+                      baseline_x=None, baseline_agg=None,
+                      baseline_label="Ingen guidance (baseline)"):
+    """Save one PNG per metric into `out_dir`, named `<metric>.png`.
+
+    Each plot is a single line (metric mean vs `x_list`) with an optional dashed
+    horizontal baseline read from `baseline_agg[baseline_x]` (defaults to the same
+    series). Metrics that are entirely NaN (e.g. opensr metrics when skipped) are
+    omitted. `x_list` is the sweep axis (guidance scale, λ, steps, …).
+    """
+    import math as _math
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if baseline_agg is None:
+        baseline_agg = agg_mode
+    base_ok = baseline_x is not None and baseline_x in baseline_agg
+
+    for key in metrics:
+        ys = [agg_mode[x][key][0] for x in x_list]
+        if all(_math.isnan(y) for y in ys):
+            continue
+        fig, ax = plt.subplots(figsize=(6.0, 4.5))
+        ax.plot(x_list, ys, marker="o", lw=2, color="tab:blue",
+                label="Gennemsnit af testbilleder")
+        if base_ok:
+            by = baseline_agg[baseline_x][key][0]
+            if by == by:  # not NaN
+                ax.axhline(by, color="tab:red", linestyle="--", lw=1.8, label=baseline_label)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(METRIC_LABELS.get(key, key))
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best", frameon=True)
+        # // break marks when the y-axis does not start at 0.
+        if ax.get_ylim()[0] > 0:
+            d = 0.015
+            kw = dict(transform=ax.transAxes, color="black", clip_on=False, lw=1.5)
+            ax.plot((-d, d), (-d, d), **kw)
+            ax.plot((-d, d), (-d + 0.02, d + 0.02), **kw)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"{key}.png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+
 
 def save_one_curve(agg_mode, gs_list, out_path, title, x_label,
                    baseline_x=None, panel_metrics=None,
@@ -406,6 +529,7 @@ def save_one_curve(agg_mode, gs_list, out_path, title, x_label,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    import math
     if panel_metrics is None:
         panel_metrics = PANEL_METRICS_FULL
     if baseline_agg is None:
@@ -414,7 +538,10 @@ def save_one_curve(agg_mode, gs_list, out_path, title, x_label,
     if n <= 2:
         nrows, ncols, figsize = 1, n, (5.5 * n, 4.5)
     else:
-        nrows, ncols, figsize = 2, 2, (11, 7.5)
+        # 2 columns (so 6 panels => a 3×2 grid); square-ish for larger counts.
+        ncols = 2 if n <= 6 else math.ceil(math.sqrt(n))
+        nrows = math.ceil(n / ncols)
+        figsize = (ncols * 5.5, nrows * 4.0)
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
     axes_flat = list(axes.flat)
 
@@ -502,15 +629,17 @@ def write_final_outputs(args, rows, run_dir, sweeps, stage, cmd_line):
     print(f"\nPer-(tile, gs, mode) results saved to {out_csv}")
 
     if args.save_plot:
+        # One plot file per metric, in a per-mode folder (cfg_plots / cfgpp_plots).
+        metrics_to_plot = (["psnr", "ssim", "lpips"]
+                           if getattr(args, "no_opensr_test", False) else METRIC_COLS)
         for cfg_pp, gs_list in sweeps:
             cp = int(cfg_pp)
             tag = "cfgpp" if cp == 1 else "cfg"
-            method = "CFG++" if cp == 1 else "CFG"
             x_label = "λ (CFG++)" if cp == 1 else "Guidance scale"
             # The neutral "no-guidance" reference is plain conditional DDIM =
-            # standard CFG at gs=1.0. Draw that on BOTH plots: for CFG it lives in
-            # its own aggregates; for CFG++ we cross-plot the CFG aggregates, since
-            # no CFG++ λ equals plain conditional (every λ renoises with e_uncond).
+            # standard CFG at gs=1.0. For CFG we read it from its own aggregates;
+            # for CFG++ we cross-plot the CFG aggregates, since no CFG++ λ equals
+            # plain conditional (every λ renoises with e_uncond).
             baseline_x = 1.0
             if cp == 1:
                 baseline_agg = agg.get(0)               # standard-CFG aggregates
@@ -518,13 +647,11 @@ def write_final_outputs(args, rows, run_dir, sweeps, stage, cmd_line):
             else:
                 baseline_agg = None                      # use CFG's own gs=1.0
                 baseline_label = "Ingen guidance (baseline)"
-            plot_path = run_dir / f"curve_{tag}.png"
-            title = (f"Effekt af {method} på {stage} UNet"
-                     if stage else f"Effekt af {method}")
-            save_one_curve(agg[cp], gs_list, plot_path, title, x_label,
-                           baseline_x=baseline_x, panel_metrics=panel_metrics,
-                           baseline_agg=baseline_agg, baseline_label=baseline_label)
-            print(f"Plot saved to {plot_path}")
+            plots_dir = run_dir / f"{tag}_plots"
+            save_metric_plots(agg[cp], gs_list, plots_dir, x_label, metrics_to_plot,
+                              baseline_x=baseline_x, baseline_agg=baseline_agg,
+                              baseline_label=baseline_label)
+            print(f"Per-metric plots saved to {plots_dir}/ ({len(metrics_to_plot)} metrics)")
 
 
 def write_shard_csv(rows, run_dir, shard_idx):
@@ -613,11 +740,13 @@ def main():
                         help="Also run a CFG++ sweep at small λ values (and save a second plot). "
                              "CFG++ uses a fundamentally different scale range than standard CFG "
                              "(λ ∈ (0, 1] per Chung et al. 2024).")
-    parser.add_argument("--gs_cfgpp", default="0.1,0.3,0.5,0.6,0.7,0.9,1.0",
+    parser.add_argument("--gs_cfgpp", default="0.05,0.1,0.15,0.2,0.25,0.3,0.9",
                         help="Comma-separated λ values for the CFG++ sweep (only used with --cfgpp). "
-                             "λ ∈ (0,1]: λ=1 is fully conditional, λ≈0.6 is the paper's sweet spot. "
-                             "Do NOT include λ=0 — that is purely unconditional sampling (ignores "
-                             "the S1/S2 conditioning and hallucinates an unrelated scene).")
+                             "λ ∈ (0,1]: λ→1 is fully conditional. Densely sampled at the low end, "
+                             "where the perceptual (LPIPS) optimum sits for this model; 0.9 is a "
+                             "high-λ anchor showing the degradation toward full conditional. Do NOT "
+                             "include λ=0 — that is purely unconditional (ignores S1/S2, hallucinates "
+                             "an unrelated scene). Very low λ (≤0.05) may also drift off the conditioning.")
     parser.add_argument("--sampling_steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42,
                         help="Seed applied before every forward so CFG and CFG++ share the "
