@@ -205,18 +205,29 @@ class SRLatentDiffusion(torch.nn.Module):
         return a_prev.sqrt() * pred_x0 + dir_xt + noise
 
     def _ddim_step_cfg_pp(self, latent, e_cond, e_uncond, guidance_scale, index, ddim, temperature):
-        """CFG++ DDIM step: guidance applied in x0-space, direction kept from conditioned pass."""
+        """CFG++ DDIM step (Chung et al., 2024, "Manifold-constrained CFG").
+
+        Two things distinguish CFG++ from standard CFG:
+          1. The denoised estimate x0 uses an *interpolated* noise
+             ε̃ = e_uncond + λ·(e_cond − e_uncond), with λ = guidance_scale ∈ [0, 1]
+             (λ=0 → unconditional, λ=1 → conditional). This is NOT the w≥1
+             extrapolation used by standard CFG.
+          2. The renoising "direction toward x_t" term uses the *unconditional*
+             noise e_uncond — the manifold constraint that is the whole point of
+             CFG++ — rather than the guided noise.
+        """
         B, device = latent.shape[0], latent.device
         a_t      = torch.full((B, 1, 1, 1), ddim.ddim_alphas[index],                   device=device)
         a_prev   = torch.full((B, 1, 1, 1), ddim.ddim_alphas_prev[index],              device=device)
         sigma_t  = torch.full((B, 1, 1, 1), ddim.ddim_sigmas[index],                   device=device)
         sqrt_1ma = torch.full((B, 1, 1, 1), ddim.ddim_sqrt_one_minus_alphas[index],    device=device)
-        pred_x0_cond   = (latent - sqrt_1ma * e_cond)   / a_t.sqrt()
-        pred_x0_uncond = (latent - sqrt_1ma * e_uncond) / a_t.sqrt()
-        pred_x0_guided = pred_x0_cond + guidance_scale * (pred_x0_cond - pred_x0_uncond)
-        dir_xt = (1.0 - a_prev - sigma_t ** 2).sqrt() * e_cond
-        noise  = sigma_t * torch.randn_like(latent) * temperature
-        return a_prev.sqrt() * pred_x0_guided + dir_xt + noise
+        # x0 estimate from the interpolated (λ∈[0,1]) guidance noise.
+        e_guided = e_uncond + guidance_scale * (e_cond - e_uncond)
+        pred_x0  = (latent - sqrt_1ma * e_guided) / a_t.sqrt()
+        # Renoise toward x_t using the UNCONDITIONAL score (CFG++ manifold constraint).
+        dir_xt   = (1.0 - a_prev - sigma_t ** 2).sqrt() * e_uncond
+        noise    = sigma_t * torch.randn_like(latent) * temperature
+        return a_prev.sqrt() * pred_x0 + dir_xt + noise
 
     @torch.no_grad()
     def forward(
