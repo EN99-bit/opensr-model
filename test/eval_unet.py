@@ -130,13 +130,31 @@ def save_curve(per_t_stats, out_path, title):
 
 
 def resolve_run_dir(args):
-    """Per-UNet output subdir: <out_dir>/<stage>_<ckpt-stem>/."""
+    """Per-UNet output subdir: <out_dir>/<raw-stage>_<ckpt-stem>/.
+
+    Returns (run_dir, display_stage). The folder uses the literal path
+    component (so "5to1m_with_s2_last" and "1m_last" stay distinct), but the
+    display_stage normalizes cascade names ("5to1m..." → "1m") for the title.
+    """
     ckpt_path = pathlib.Path(args.unet_ckpt)
-    stage = next((p for p in ckpt_path.parts if re.fullmatch(r"\d+m", p)), None)
-    label = f"{stage}_{ckpt_path.stem}" if stage else ckpt_path.stem
+    # Match either a plain resolution ("1m", "5m") or a cascade variant ("5to1m", "5to1m_with_s2").
+    raw_stage = next(
+        (p for p in ckpt_path.parts
+         if re.fullmatch(r"\d+m", p) or re.match(r"^\d+to\d+m", p)),
+        None,
+    )
+    label = f"{raw_stage}_{ckpt_path.stem}" if raw_stage else ckpt_path.stem
     run_dir = pathlib.Path(args.out_dir) / label
     run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir, stage
+
+    # Cascade naming ("5to1m...") describes input→output stages; the *output* (target
+    # resolution after the to) is what the model actually produces, so title shows that.
+    display_stage = raw_stage
+    if raw_stage:
+        m = re.match(r"^\d+to(\d+)m", raw_stage)
+        if m:
+            display_stage = f"{m.group(1)}m"
+    return run_dir, display_stage
 
 
 def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
