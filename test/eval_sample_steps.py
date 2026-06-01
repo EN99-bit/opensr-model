@@ -49,6 +49,7 @@ sys.path.insert(0, str(ROOT / "test"))
 import eval_cfg
 from eval_cfg import (
     score_batch, save_metric_plots, save_tile_grid, resolve_run_dir,
+    resolve_cond_mode, batch_cond_5m, aerial_rgb_u8, AERIAL_5M_NATIVE,
     lpips_score, to_rgb_u8_norm, METRIC_COLS, OPENSR_METRICS,
     PANEL_METRICS_FULL, PANEL_METRICS_PIXEL,
 )
@@ -126,6 +127,8 @@ def run_eval_loop(args, steps_list, shard_idx=0, shard_count=1):
     mode_label = "CFG++" if cfg_pp else "CFG"
     print(f"{tag} steps sweep={steps_list}  guidance={args.gs} ({mode_label})  eta={args.eta}")
 
+    cond_mode, variant, stage1, gt_map = resolve_cond_mode(args, cfg, device, tag)
+
     ds = FusionDataset(args.npz_dir, require_aerial=True, pad=False)
     if len(ds) == 0:
         print("No valid tiles found.")
@@ -150,11 +153,20 @@ def run_eval_loop(args, steps_list, shard_idx=0, shard_count=1):
                               disable=not show_progress):
         samples = [ds[i] for i in batch_indices]
         names = [pathlib.Path(s["path"]).stem for s in samples]
+
+        # Stage-2 conditioning (None = direct S2+S1), built once per batch.
+        cond_5m, samples, names = batch_cond_5m(
+            cond_mode, samples, names, device, stage1, gt_map, getattr(args, "stage1_steps", 100))
+        if not samples:
+            continue
+        cond5m_rgb = {n: aerial_rgb_u8(cond_5m[i], AERIAL_5M_NATIVE) for i, n in enumerate(names)} if cond_5m is not None else {}
+
         tile_srs = {} if save_images else None
 
         for steps in steps_list:
             args.sampling_steps = steps   # score_batch reads args.sampling_steps
-            batch_results, batch_thumbs = score_batch(model, samples, args, args.gs, cfg_pp)
+            batch_results, batch_thumbs = score_batch(model, samples, args, args.gs, cfg_pp,
+                                                       cond_5m=cond_5m, variant=variant)
             for name, m in zip(names, batch_results):
                 rows.append({"tile": name, "steps": steps,
                              **{k: m[k] for k in METRIC_COLS}})
@@ -176,9 +188,13 @@ def run_eval_loop(args, steps_list, shard_idx=0, shard_count=1):
                           .clip(0, 255).astype(np.uint8))
                 if name in tile_srs:
                     out_path = images_dir / f"{name}_steps.png"
+                    extra = []
+                    if name in cond5m_rgb:
+                        lbl = "5m (predicted)" if cond_mode == "cascade" else "5m (GT)"
+                        extra.append((lbl, cond5m_rgb[name]))
+                    extra.append(("Bicubic", b_thumb_by_name[name]))
                     save_tile_grid(name, hr_rgb, tile_srs[name], mode_label, out_path,
-                                   label_fmt="{:g} steps",
-                                   extra_panels=[("Bicubic", b_thumb_by_name[name])])
+                                   label_fmt="{:g} steps", extra_panels=extra)
     return rows
 
 
@@ -234,6 +250,12 @@ def run_multi_gpu(args, steps_list, n_devices):
             cmd += ["--no_opensr_test"]
         if args.save_images:
             cmd += ["--save_images"]
+        if getattr(args, "cond_5m_dir", None):
+            cmd += ["--cond_5m_dir", args.cond_5m_dir]
+        if getattr(args, "cascade", False):
+            cmd += ["--cascade", "--stage1_ckpt", args.stage1_ckpt,
+                    "--stage1_config", args.stage1_config,
+                    "--stage1_steps", str(args.stage1_steps)]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(i)
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -343,9 +365,24 @@ def main():
                         help="GPUs to shard tiles across (>1 launches subprocesses).")
     parser.add_argument("--shard", type=str, default=None,
                         help="Internal: 'idx/count' for a single shard worker.")
+    # Stage-2 conditioning modes (5→1m cascade models). Default: direct S2+S1.
+    parser.add_argument("--cond_5m_dir", type=str, default=None,
+                        help="Stage-2 ISOLATED: condition on GT 5m aerial from this dir.")
+    parser.add_argument("--cascade", action="store_true",
+                        help="Full cascade: predict 5m via a stage-1 model, then condition "
+                             "stage-2 on it. Needs --stage1_ckpt/_config.")
+    parser.add_argument("--stage1_ckpt", type=str, default=None)
+    parser.add_argument("--stage1_config", type=str, default=None)
+    parser.add_argument("--stage1_steps", type=int, default=100)
     args = parser.parse_args()
     # score_batch reads this attribute; set a placeholder so the namespace is complete.
     args.sampling_steps = None
+
+    assert not (args.cascade and args.cond_5m_dir), \
+        "--cascade and --cond_5m_dir are mutually exclusive"
+    if args.cascade:
+        assert args.stage1_ckpt and args.stage1_config, \
+            "--cascade requires --stage1_ckpt and --stage1_config"
 
     steps_list = sorted(int(s) for s in args.steps.split(","))
     assert all(s > 0 for s in steps_list), "--steps values must be > 0"

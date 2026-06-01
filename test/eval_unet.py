@@ -66,6 +66,8 @@ sys.path.insert(0, str(ROOT / "test"))
 from eval_cfg import (
     save_metric_plots, save_tile_grid, lpips_score, OPENSR_METRICS, OM_HA_PANEL,
     PANEL_METRICS_FULL, PANEL_METRICS_PIXEL,
+    resolve_cond_mode, build_cascade_cond, predict_5m, load_5m_aerial, aerial_rgb_u8,
+    AERIAL_5M_NATIVE,
 )
 
 try:
@@ -110,29 +112,6 @@ def predict_x0(model, z_t, t_int, cond, a_bar_t):
     return (z_t - sqrt_1ma * eps_hat) / sqrt_a
 
 
-AERIAL_KEYS = ("aerial_r", "aerial_g", "aerial_b", "aerial_nir")
-AERIAL_5M_PAD = 256   # 5m aerial: 200×200 native → 256 (matches training)
-
-
-def build_cond_5m_s1(model, aerial_5m, s1, pad_size):
-    """Cascade stage-2 conditioning, matching train_unet_5-1_with_s1._build_conditioning:
-    VAE(5m aerial upsampled to pad_size)[4ch] + S1[2ch] = 6ch.
-
-    `aerial_5m` is (B,4,256,256) in [0,255]; `s1` is (B,2,128,128). Uses the VAE
-    posterior mode() (deterministic) rather than sample(), since this is an oracle.
-    """
-    vae = model.model.first_stage_model
-    vae_dtype = next(vae.parameters()).dtype
-    latent = pad_size // model.vae_downscale
-    aerial_up = F.interpolate(normalize_aerial(aerial_5m, stage="norm"),
-                              size=(pad_size, pad_size), mode="bilinear", align_corners=False)
-    with torch.no_grad():
-        cond_5m = vae.encode(aerial_up.to(vae_dtype)).mode().float()
-    cond_s1 = F.interpolate(normalize_s1(s1, stage="norm"),
-                            size=(latent, latent), mode="bilinear", align_corners=False)
-    return torch.cat([cond_5m, cond_s1], dim=1)
-
-
 def to_rgb_u8(img_norm):
     """[-1,1] (1,4,H,W) tensor -> RGB uint8 (H,W,3) for skimage metrics."""
     arr = normalize_aerial(img_norm, stage="denorm")[0, :3].cpu().numpy().transpose(1, 2, 0)
@@ -154,6 +133,11 @@ def resolve_run_dir(args):
         None,
     )
     label = f"{raw_stage}_{ckpt_path.stem}" if raw_stage else ckpt_path.stem
+    # Tag by conditioning mode so direct / isolated / cascade runs don't overwrite.
+    if getattr(args, "cascade", False):
+        label += "__cascade"
+    elif getattr(args, "cond_5m_dir", None):
+        label += "__cond5m"
     run_dir = pathlib.Path(args.out_dir) / label
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -193,17 +177,8 @@ def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
     tile_indices = list(range(shard_idx, n_total, shard_count))
     print(f"{tag} Evaluating {len(tile_indices)} of {n_total} tiles at t-fractions {t_fracs}")
 
-    # Cascade stage-2 (5to1m) models condition on the 5m aerial, not S2. When a 5m
-    # tile dir is given, build conditioning from the paired 5m aerial + S1 (matching
-    # training); otherwise use the model's default S2+S1 encoding.
-    cond_5m_map = None
-    if getattr(args, "cond_5m_dir", None):
-        cond_5m_map = {p.stem: p for p in sorted(pathlib.Path(args.cond_5m_dir).glob("*.npz"))}
-        if not cond_5m_map:
-            print(f"No .npz tiles in --cond_5m_dir {args.cond_5m_dir}")
-            return [], int(OmegaConf.load(args.config).denoiser_settings.timesteps)
-        print(f"{tag} Cascade conditioning: VAE(5m aerial)+S1 from {args.cond_5m_dir} "
-              f"({len(cond_5m_map)} tiles)")
+    # Stage-2 conditioning mode: direct (S2+S1), isolated (GT 5m), or cascade (predicted 5m).
+    cond_mode, variant, stage1, gt_map = resolve_cond_mode(args, cfg, device, tag)
 
     save_images = getattr(args, "save_images", False)
     if save_images:
@@ -228,19 +203,20 @@ def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
             z_0 = encode_target(model, x_norm)
             s2_p, _ = pad_to_size(s2, LR_PAD_SIZE)
             s1_p, _ = pad_to_size(s1, LR_PAD_SIZE)
-            if cond_5m_map is not None:
-                # Build cascade conditioning from the paired 5m aerial + S1.
-                p5 = cond_5m_map.get(name)
+            # Stage-2 conditioning: 5m aerial (predicted in cascade, GT in isolated),
+            # else the model's default S2+S1 encoding.
+            aerial_5m = None
+            if cond_mode == "cascade":
+                aerial_5m = predict_5m(stage1, s2_p, s1_p, getattr(args, "stage1_steps", 100))
+            elif cond_mode == "isolated":
+                p5 = gt_map.get(name)
                 if p5 is None:
                     if show_progress:
                         print(f"  [skip] no 5m tile for {name}")
                     continue
-                with np.load(p5, allow_pickle=True) as d5:
-                    aerial_5m = torch.from_numpy(
-                        np.stack([d5[k].astype(np.float32) for k in AERIAL_KEYS])
-                    ).unsqueeze(0).to(device)
-                aerial_5m, _ = pad_to_size(aerial_5m, AERIAL_5M_PAD)
-                cond = build_cond_5m_s1(model, aerial_5m, s1_p, args.pad_size)
+                aerial_5m = load_5m_aerial(p5, device)
+            if aerial_5m is not None:
+                cond = build_cascade_cond(model, aerial_5m, s1_p, s2_p, variant, args.pad_size)
             else:
                 cond = model._tensor_encode(s2_p, s1_p)
             assert z_0.shape[-2:] == cond.shape[-2:], (
@@ -301,8 +277,12 @@ def run_eval_loop(args, t_fracs, shard_idx=0, shard_count=1):
                 rows.append(row)
 
             if tile_thumbs is not None:
+                extra = None
+                if aerial_5m is not None:
+                    lbl = "5m (predicted)" if cond_mode == "cascade" else "5m (GT)"
+                    extra = [(lbl, aerial_rgb_u8(aerial_5m[0], AERIAL_5M_NATIVE))]
                 save_tile_grid(name, hr_u8, tile_thumbs, "UNet-orakel", images_dir / f"{name}.png",
-                               label_fmt="t/T={:g}")
+                               label_fmt="t/T={:g}", extra_panels=extra)
 
     return rows, T
 
@@ -412,6 +392,10 @@ def run_multi_gpu(args, t_fracs, n_devices):
             cmd += ["--save_images"]
         if args.cond_5m_dir:
             cmd += ["--cond_5m_dir", args.cond_5m_dir]
+        if args.cascade:
+            cmd += ["--cascade", "--stage1_ckpt", args.stage1_ckpt,
+                    "--stage1_config", args.stage1_config,
+                    "--stage1_steps", str(args.stage1_steps)]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(i)
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -444,9 +428,14 @@ def main():
     parser.add_argument("--pad_size", type=int, required=True,
                         help="Zero-pad aerial tiles to this size (1024 for 1m, 256 for 5m).")
     parser.add_argument("--cond_5m_dir", type=str, default=None,
-                        help="For cascade stage-2 (5to1m) models: directory of 5m NPZ tiles. "
-                             "Conditioning is then VAE(5m aerial)+S1 (matching training) instead "
-                             "of the default S2+S1. Tiles are paired with --npz_dir by filename stem.")
+                        help="Stage-2 ISOLATED (5to1m models): condition on the GT 5m aerial from "
+                             "this dir (paired with --npz_dir by stem) instead of S2+S1.")
+    parser.add_argument("--cascade", action="store_true",
+                        help="Full cascade: predict the 5m aerial with a stage-1 (10→5m) model, "
+                             "then condition stage-2 on it. Needs --stage1_ckpt/_config.")
+    parser.add_argument("--stage1_ckpt", type=str, default=None)
+    parser.add_argument("--stage1_config", type=str, default=None)
+    parser.add_argument("--stage1_steps", type=int, default=100)
     parser.add_argument("--t_fracs", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
                         help="Comma-separated fractions of T to test (each in (0,1))")
     parser.add_argument("--out_dir", default=str(ROOT / "test" / "results" / "unet-oracle"))
@@ -468,6 +457,12 @@ def main():
     parser.add_argument("--shard", type=str, default=None,
                         help="i/N stripe selector (internal; set by the multi-GPU launcher).")
     args = parser.parse_args()
+
+    assert not (args.cascade and args.cond_5m_dir), \
+        "--cascade and --cond_5m_dir are mutually exclusive"
+    if args.cascade:
+        assert args.stage1_ckpt and args.stage1_config, \
+            "--cascade requires --stage1_ckpt and --stage1_config"
 
     t_fracs = sorted(float(s) for s in args.t_fracs.split(","))
     assert all(0 < f < 1 for f in t_fracs), "--t_fracs values must be in (0, 1)"

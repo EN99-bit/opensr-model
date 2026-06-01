@@ -61,9 +61,14 @@ sys.path.insert(0, str(ROOT))
 
 from opensr_model.srmodel import SRLatentDiffusion
 from opensr_model.data import FusionDataset, LR_PAD_SIZE
-from opensr_model.utils import normalize_s2
+from opensr_model.utils import normalize_s2, normalize_s1, normalize_aerial
 
 from eval import load_trained_weights
+
+# 5m aerial keys + native/pad size for cascade/stage-2 conditioning.
+AERIAL_KEYS = ("aerial_r", "aerial_g", "aerial_b", "aerial_nir")
+AERIAL_5M_PAD = 256
+AERIAL_5M_NATIVE = 200   # content size inside the 256 pad (used to crop the display panel)
 
 
 # opensr_test produces these in addition to our PSNR/SSIM.
@@ -141,6 +146,65 @@ def lpips_score(sr_norm, hr_norm, device):
         return float(_LPIPS_MODEL(sr, hr).item())
 
 
+# ── Cascade / stage-2 conditioning ──────────────────────────────────────────
+def cascade_variant(cfg):
+    """'s1' or 's1s2' from the stage-2 UNet's in_channels (z_channels=4 + cond)."""
+    in_ch = int(cfg.cond_stage_config.in_channels)
+    return "s1s2" if (in_ch - 4) >= 10 else "s1"
+
+
+def build_cascade_cond(model, aerial_5m, s1, s2, variant, pad_size):
+    """Stage-2 conditioning from a 5m aerial (GT or stage-1 predicted):
+    VAE(5m)[4] + S1[2]  (+ VAE(S2)[4] for the s1s2 variant). Matches
+    train_unet_5-1 / eval_cascade_npz ordering. aerial_5m,s2 in [0,255]/DN.
+    """
+    vae = model.model.first_stage_model
+    vae_dtype = next(vae.parameters()).dtype
+    latent = pad_size // model.vae_downscale
+    a_up = F.interpolate(normalize_aerial(aerial_5m, stage="norm"),
+                         size=(pad_size, pad_size), mode="bilinear", align_corners=False)
+    with torch.no_grad():
+        cond_5m = vae.encode(a_up.to(vae_dtype)).mode().float()
+    cond_s1 = F.interpolate(normalize_s1(s1, stage="norm"),
+                            size=(latent, latent), mode="bilinear", align_corners=False)
+    parts = [cond_5m, cond_s1]
+    if variant == "s1s2":
+        s2_up = F.interpolate(normalize_s2(s2, stage="norm"),
+                              size=(pad_size, pad_size), mode="bilinear", align_corners=False)
+        with torch.no_grad():
+            cond_s2 = vae.encode(s2_up.to(vae_dtype)).mode().float()
+        parts.append(cond_s2)
+    return torch.cat(parts, dim=1)
+
+
+def load_stage1(stage1_ckpt, stage1_config, device):
+    """Load the stage-1 (10→5m) model for cascade prediction of the 5m aerial."""
+    cfg1 = OmegaConf.load(stage1_config)
+    m1 = SRLatentDiffusion(cfg1, device=device)
+    load_trained_weights(m1, stage1_ckpt)
+    return m1.to(device).eval()
+
+
+@torch.no_grad()
+def predict_5m(stage1_model, s2_p, s1_p, steps):
+    """Run stage-1 → predicted 5m aerial (B,4,256,256) in [0,255]. s2_p/s1_p are LR-padded."""
+    return stage1_model.forward(s2_p, s1_p, sampling_steps=steps, guidance_scale=1.0,
+                                histogram_matching=False, apply_nodata_mask=False)
+
+
+def load_5m_gt_map(cond_5m_dir):
+    """{tile_stem: npz_path} for the paired 5m-aerial tiles (stage-2 isolated mode)."""
+    return {p.stem: p for p in sorted(pathlib.Path(cond_5m_dir).glob("*.npz"))}
+
+
+def load_5m_aerial(npz_path, device):
+    """Load a 5m aerial tile (4,H,W)[0,255] → (1,4,256,256) zero-padded, on device."""
+    with np.load(npz_path, allow_pickle=True) as d:
+        a = torch.from_numpy(np.stack([d[k].astype(np.float32) for k in AERIAL_KEYS]))
+    a = a.unsqueeze(0).to(device)
+    return pad_to_size(a, AERIAL_5M_PAD)[0]
+
+
 def pad_to_size(x: torch.Tensor, size: int):
     h, w = x.shape[-2:]
     ph, pw = size - h, size - w
@@ -156,13 +220,69 @@ def to_rgb_u8_norm(t01):
     return arr.clip(0, 255).astype(np.uint8)
 
 
-def score_batch(model, samples, args, gs, cfg_pp):
+def aerial_rgb_u8(a, native=None):
+    """(4,H,W) aerial tensor in [0,255] -> (H,W,3) uint8 RGB (drop NIR).
+
+    If `native` is given and smaller than the tile, center-crop to native×native
+    first — removes the symmetric zero-pad border (e.g. the 5m panel: 256 → 200).
+    """
+    if native and a.shape[-1] > native:
+        off = (a.shape[-1] - native) // 2
+        a = a[:, off:off + native, off:off + native]
+    return a[:3].clamp(0, 255).cpu().numpy().transpose(1, 2, 0).astype(np.uint8)
+
+
+def resolve_cond_mode(args, cfg, device, tag=""):
+    """Set up the stage-2 conditioning source. Returns (mode, variant, stage1, gt_map)."""
+    variant = cascade_variant(cfg)
+    if getattr(args, "cascade", False):
+        stage1 = load_stage1(args.stage1_ckpt, args.stage1_config, device)
+        print(f"{tag} Cascade conditioning: stage-1 {pathlib.Path(args.stage1_ckpt).name} "
+              f"→ predicted 5m, variant={variant}")
+        return "cascade", variant, stage1, None
+    if getattr(args, "cond_5m_dir", None):
+        gt_map = load_5m_gt_map(args.cond_5m_dir)
+        print(f"{tag} Stage-2 isolated: GT 5m from {args.cond_5m_dir} "
+              f"({len(gt_map)} tiles), variant={variant}")
+        return "isolated", variant, None, gt_map
+    return "direct", variant, None, None
+
+
+def batch_cond_5m(cond_mode, samples, names, device, stage1, gt_map, stage1_steps):
+    """Build the (B,4,256,256) 5m conditioning for a batch (None for direct mode).
+    Returns (cond_5m, kept_samples, kept_names) — tiles without a 5m match are dropped."""
+    if cond_mode == "direct":
+        return None, samples, names
+    if cond_mode == "isolated":
+        keep = [(s, n) for s, n in zip(samples, names) if n in gt_map]
+        if len(keep) != len(samples):
+            miss = [n for n in names if n not in gt_map]
+            print(f"  [skip] no 5m tile for {miss}")
+        samples = [s for s, _ in keep]
+        names = [n for _, n in keep]
+        if not samples:
+            return None, samples, names
+        cond = torch.cat([load_5m_aerial(gt_map[n], device) for n in names], dim=0)
+        return cond, samples, names
+    # cascade: run stage-1 to predict the 5m aerial
+    s2 = pad_to_size(torch.stack([s["s2"] for s in samples]).to(device), LR_PAD_SIZE)[0]
+    s1 = pad_to_size(torch.stack([s["s1"] for s in samples]).to(device), LR_PAD_SIZE)[0]
+    return predict_5m(stage1, s2, s1, stage1_steps), samples, names
+
+
+def score_batch(model, samples, args, gs, cfg_pp, cond_5m=None, variant="s1"):
     """Batched DDIM at (gs, cfg_pp) for B tiles.
 
     Returns `(results, sr_thumbs)`:
       - `results`: list of per-tile metric dicts.
       - `sr_thumbs`: list of (H, W, 3) uint8 RGB arrays — the same SR data the metric
         functions already use, returned for optional saving (effectively free).
+
+    `cond_5m` (B,4,256,256) selects stage-2 conditioning: when given, the model is
+    conditioned on VAE(5m)+S1 (+VAE(S2) for s1s2) instead of the default S2+S1 —
+    via a temporary `_tensor_encode` patch, so all of `forward`'s CFG/CFG++/step
+    logic is reused. `cond_5m` is the GT 5m (isolated mode) or stage-1's predicted
+    5m (cascade mode).
 
     Stacking tiles along the batch dim lets the UNet process them all in one forward
     per DDIM step — much higher GPU utilization than batch_size=1.
@@ -185,16 +305,28 @@ def score_batch(model, samples, args, gs, cfg_pp):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
-    with torch.no_grad():
-        sr = model.forward(
-            s2_p, s1_p,
-            sampling_steps=args.sampling_steps,
-            sampling_eta=args.eta,            # None -> forward falls back to the config value
-            guidance_scale=gs,
-            cfg_plus_plus=cfg_pp,
-            histogram_matching=False,
-            apply_nodata_mask=False,
-        )  # [0, 255], (B, 4, sr_H, sr_W)
+    # Stage-2 / cascade: inject VAE(5m)+S1 conditioning by patching _tensor_encode.
+    orig_encode = None
+    if cond_5m is not None:
+        orig_encode = model._tensor_encode
+        def _patched_encode(X_s2, X_s1, _c=cond_5m, _v=variant):
+            return build_cascade_cond(model, _c, X_s1, X_s2, _v, args.pad_size)
+        model._tensor_encode = _patched_encode
+
+    try:
+        with torch.no_grad():
+            sr = model.forward(
+                s2_p, s1_p,
+                sampling_steps=args.sampling_steps,
+                sampling_eta=args.eta,            # None -> forward falls back to the config value
+                guidance_scale=gs,
+                cfg_plus_plus=cfg_pp,
+                histogram_matching=False,
+                apply_nodata_mask=False,
+            )  # [0, 255], (B, 4, sr_H, sr_W)
+    finally:
+        if orig_encode is not None:
+            model._tensor_encode = orig_encode
 
     sr_size = sr.shape[-1]
     p = (sr_size - native_hr) // 2
@@ -254,6 +386,11 @@ def resolve_run_dir(args):
         None,
     )
     label = f"{raw_stage}_{ckpt_path.stem}" if raw_stage else ckpt_path.stem
+    # Tag by conditioning mode so direct / isolated / cascade runs don't overwrite.
+    if getattr(args, "cascade", False):
+        label += "__cascade"
+    elif getattr(args, "cond_5m_dir", None):
+        label += "__cond5m"
     run_dir = pathlib.Path(args.out_dir) / label
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -326,6 +463,8 @@ def run_eval_loop(args, sweeps, shard_idx=0, shard_count=1):
     model = model.to(device).eval()
     print(f"{tag} sampling_steps={args.sampling_steps}, sweeps={sweeps}")
 
+    cond_mode, variant, stage1, gt_map = resolve_cond_mode(args, cfg, device, tag)
+
     ds = FusionDataset(args.npz_dir, require_aerial=True, pad=False)
     if len(ds) == 0:
         print("No valid tiles found.")
@@ -352,13 +491,22 @@ def run_eval_loop(args, sweeps, shard_idx=0, shard_count=1):
     for batch_indices in iterator:
         samples = [ds[i] for i in batch_indices]
         names = [pathlib.Path(s["path"]).stem for s in samples]
+
+        # Build the stage-2 conditioning once per batch (None = direct S2+S1).
+        cond_5m, samples, names = batch_cond_5m(
+            cond_mode, samples, names, device, stage1, gt_map, getattr(args, "stage1_steps", 100))
+        if not samples:
+            continue
+        cond5m_rgb = {n: aerial_rgb_u8(cond_5m[i], AERIAL_5M_NATIVE) for i, n in enumerate(names)} if cond_5m is not None else {}
+
         # When --save_images is set, accumulate SR thumbs per (tile, mode) so we can
         # render one grid (Original + SR@each gs) per (tile, mode) at end of batch.
         tile_srs = {} if save_images else None
 
         for cfg_pp, gs_list in sweeps:
             for gs in gs_list:
-                batch_results, batch_thumbs = score_batch(model, samples, args, gs, cfg_pp)
+                batch_results, batch_thumbs = score_batch(model, samples, args, gs, cfg_pp,
+                                                           cond_5m=cond_5m, variant=variant)
                 for name, m in zip(names, batch_results):
                     rows.append({
                         "tile": name, "gs": gs, "cfg_pp": int(cfg_pp),
@@ -381,15 +529,18 @@ def run_eval_loop(args, sweeps, shard_idx=0, shard_count=1):
                     mode_label = "CFG++" if cp == 1 else "CFG"
                     mode_tag = "cfgpp" if cp == 1 else "cfg"
                     out_path = images_dir / f"{name}_{mode_tag}.png"
-                    # On the CFG++ grid, show the plain-conditional CFG gs=1 output as
-                    # a reference panel (right after Original), if it was computed.
-                    extra = None
+                    # Reference panels after Original: the 5m input (cascade/isolated)
+                    # and, on the CFG++ grid, the plain-conditional CFG gs=1 output.
+                    extra = []
+                    if name in cond5m_rgb:
+                        lbl = "5m (predicted)" if cond_mode == "cascade" else "5m (GT)"
+                        extra.append((lbl, cond5m_rgb[name]))
                     if cp == 1:
                         base_thumb = tile_srs.get((name, 0), {}).get(1.0)
                         if base_thumb is not None:
-                            extra = [("CFG gs=1 (baseline)", base_thumb)]
+                            extra.append(("CFG gs=1 (baseline)", base_thumb))
                     save_tile_grid(name, hr_rgb, tile_srs[key], mode_label, out_path,
-                                   extra_panels=extra)
+                                   extra_panels=extra or None)
 
     return rows
 
@@ -706,6 +857,12 @@ def run_multi_gpu(args, sweeps, n_devices):
             cmd += ["--no_opensr_test"]
         if args.save_images:
             cmd += ["--save_images"]
+        if getattr(args, "cond_5m_dir", None):
+            cmd += ["--cond_5m_dir", args.cond_5m_dir]
+        if getattr(args, "cascade", False):
+            cmd += ["--cascade", "--stage1_ckpt", args.stage1_ckpt,
+                    "--stage1_config", args.stage1_config,
+                    "--stage1_steps", str(args.stage1_steps)]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(i)
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -771,11 +928,30 @@ def main():
                         help="Save per-tile, per-mode comparison grids "
                              "(Original + SR@each gs in a single row) under <run_dir>/images/. "
                              "One PNG per (tile, mode). Adds a bit of disk; no metric cost.")
+    # Stage-2 conditioning modes (for 5→1m cascade models). Default: direct S2+S1.
+    parser.add_argument("--cond_5m_dir", type=str, default=None,
+                        help="Stage-2 ISOLATED: condition on the GT 5m aerial from this dir "
+                             "(paired with --npz_dir by stem) instead of S2+S1.")
+    parser.add_argument("--cascade", action="store_true",
+                        help="Full cascade: run a stage-1 (10→5m) model to predict the 5m "
+                             "aerial, then condition stage-2 on it. Needs --stage1_ckpt/_config.")
+    parser.add_argument("--stage1_ckpt", type=str, default=None,
+                        help="Stage-1 (10→5m) checkpoint (with --cascade).")
+    parser.add_argument("--stage1_config", type=str, default=None,
+                        help="Stage-1 config YAML, e.g. config_10m.yaml (with --cascade).")
+    parser.add_argument("--stage1_steps", type=int, default=100,
+                        help="DDIM steps for the stage-1 prediction (with --cascade).")
     parser.add_argument("--device", default=None)
     parser.add_argument("--devices", type=int,
                         default=(torch.cuda.device_count() if torch.cuda.is_available() else 1))
     parser.add_argument("--shard", type=str, default=None)
     args = parser.parse_args()
+
+    assert not (args.cascade and args.cond_5m_dir), \
+        "--cascade and --cond_5m_dir are mutually exclusive"
+    if args.cascade:
+        assert args.stage1_ckpt and args.stage1_config, \
+            "--cascade requires --stage1_ckpt and --stage1_config"
 
     # Build the sweep list. Always include standard CFG; optionally add CFG++ at the small range.
     gs_values = sorted(float(s) for s in args.gs.split(","))
