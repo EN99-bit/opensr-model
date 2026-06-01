@@ -207,6 +207,163 @@ Added training & server deployment sections (§5.2–5.3).
 
 ---
 
+## Phase 6 — Critical Bug Fixes & Training Improvements (April 2026)
+
+### Latent scaling factor
+
+**Problem**: VAE latent space had std≈5.5 instead of ≈1.0. Noise schedule
+assumes std≈1, so signal dominated noise at most timesteps → UNet never
+learned proper denoising → hallucination at inference.
+
+**Fix**: Added `scale_factor=0.18215` to `LatentDiffusion` init in both
+`train/train_unet.py` and `opensr_model/srmodel.py`. The existing
+`get_first_stage_encoding()` and `decode_first_stage()` methods in
+`latentdiffusion.py` automatically apply this factor.
+
+### S2 band order mismatch (BGR → RGB)
+
+**Problem**: `S2_KEYS` loaded bands as `["s2_b", "s2_g", "s2_r", "s2_nir"]`
+(BGR order), while aerial was `["aerial_r", "aerial_g", "aerial_b", "aerial_nir"]`
+(RGB order). Red and blue channels were swapped in conditioning → colour
+errors (red roofs appeared grey).
+
+**Fix**: Changed `S2_KEYS` to `["s2_r", "s2_g", "s2_b", "s2_nir"]` in
+`opensr_model/data.py`.
+
+### UNet training with corrected settings
+
+Retrained UNet from scratch with all three fixes:
+- `scale_factor=0.18215`
+- `cfg_dropout=0.0` (no classifier-free guidance — conditioning always present)
+- Corrected S2 band order (RGB)
+
+### Noise schedule adjustment
+
+Changed `linear_end` in `config_10m.yaml` from `0.0155` to `0.01` for better
+noise-signal balance at high timesteps.
+
+### Mixed precision VAE encoding
+
+Added explicit dtype casting and `torch.amp.autocast("cuda", enabled=False)`
+in `_build_conditioning()` and `_encode_aerial()` to prevent fp16 precision
+issues during frozen VAE encoding under mixed precision training.
+
+### CFG inference support in `srmodel.py`
+
+Added `guidance_scale` parameter to `SRLatentDiffusion.forward()` with
+full CFG implementation:
+- `_ddim_step()`: New method for manual DDIM update with pre-computed noise
+  prediction (needed for CFG which combines two UNet passes).
+- `null_conditioning`: Zeros tensor for unconditional pass.
+- When `guidance_scale > 1.0`: runs two UNet passes and interpolates.
+- When `guidance_scale = 1.0` (default): standard single-pass DDIM.
+
+### DDP compatibility
+
+Added `LOCAL_RANK` environment variable checks in `FusionDataset` and
+`make_train_val_datasets` to suppress duplicate print statements when
+training with multiple GPUs via DDPStrategy.
+
+---
+
+## Phase 7 — 1m Aerial Support (April–May 2026)
+
+### `opensr_model/configs/config_1m.yaml` — NEW FILE
+
+Config for 10m S1+S2 → 1m aerial super-resolution:
+- `scale_factor: 8` (10m → 1m = 8× upscaling)
+- `ch_mult: [1, 2, 4, 8]` (3 downsamples → 1024→128 latent)
+- Aerial tiles: 1000×1000 at 1m, padded to 1024×1024
+
+### `opensr_model/configs/config_1m_64.yaml` — NEW FILE
+
+Alternative 1m config with `ch_mult: [1, 2, 4, 4, 8]` (4 downsamples →
+1024→64 latent) for reduced UNet compute at the cost of a deeper VAE.
+
+### `opensr_model/configs/config_opensr.yaml` — NEW FILE
+
+Config for loading and running the official OpenSR pretrained weights
+(S2-only, 4× SR). Used for baseline comparison in evaluation scripts.
+
+### `opensr_model/data.py` — MODIFIED
+
+- `HR_PAD_SIZE`: 256 → 1024 (for 1m aerial tiles)
+- `HR_NATIVE = 1000`: New constant for native 1m tile size
+- `LR_PAD`, `HR_PAD`: Computed padding constants
+- `LatentFusionDataset`: **New class** for loading precomputed VAE latents
+  from `.pt` files, enabling UNet training without VAE in GPU memory.
+
+### `train/train_unet.py` — MODIFIED
+
+- Added `--use_precomputed` flag and `LatentFusionDataset` support
+- `_shared_step()` auto-detects precomputed vs on-the-fly encoding
+- Updated docstring to reflect 1m dimensions (1024×1024, latent 128×128)
+
+### `train/train_vae_kl_1m.py` — NEW FILE
+
+VAE training script for 1m aerial data with KL divergence regularization
+(alternative to WD/MMD for the larger 1m architecture).
+
+---
+
+## Phase 8 — Evaluation & Inference Scripts (April–May 2026)
+
+### `test/eval.py` — NEW FILE
+
+Evaluation script computing all 9 opensr-test metrics (Reflectance, Spectral,
+Spatial, Synthesis, Hallucination, Omission, Improvement, PSNR, SSIM) on NPZ
+tiles. Features:
+- `--opensr` flag for baseline comparison with official pretrained model
+- `--include s1|s2|all` for ablation studies (zero out S1 or S2 channels)
+- `--out_csv` for per-tile CSV export
+- Correct padding crop for both 2× and 4× models
+
+### `test/eval_benchmark.py` — NEW FILE
+
+Evaluation on official opensr-test benchmark datasets (NAIP, SPOT, Venus,
+Spain Urban, Spain Crops, Satellogic). Supports both custom checkpoints
+(2× model) and official pretrained weights (4× model) with automatic HR
+ground truth downsampling for fair comparison.
+
+### `test/test-inference.py` — NEW FILE
+
+Inference test with trained checkpoint. Loads UNet Lightning checkpoint
+(contains both VAE and UNet weights), runs DDIM sampling, saves SR + S2
+input + aerial ground truth as PNGs.
+
+### `test/test-inference-batch.py` — NEW FILE
+
+Batch inference over multiple tiles with configurable sampling parameters.
+
+---
+
+## Phase 9 — Utility Scripts (April–May 2026)
+
+### `scripts/precompute_latents.py` — NEW FILE
+
+Precomputes VAE latents for all tiles and saves as `.pt` files. Eliminates
+VAE forward pass during UNet training → faster training, lower VRAM usage.
+Stores `z_aerial` and `z_s2` per tile.
+
+### `scripts/patch_vae_in_unet_ckpt.py` — NEW FILE
+
+Utility to patch updated VAE weights into an existing UNet checkpoint
+without retraining the UNet.
+
+### `augment_npz.py` — NEW FILE
+
+Data augmentation script for NPZ tiles (offline augmentation).
+
+### `ae-test.py` — NEW FILE
+
+Autoencoder reconstruction test and visualization.
+
+### `view-latent-space.py` — NEW FILE
+
+Visualization of latent space statistics and distributions.
+
+---
+
 ## Dependencies (`requirements.txt`) — MODIFIED
 
 - Updated all packages to modern, non-pinned versions (`>=`).
@@ -222,34 +379,49 @@ Added training & server deployment sections (§5.2–5.3).
 ### New files (our contributions)
 | File | Purpose |
 |---|---|
-| `opensr_model/data.py` | FusionDataset for S1+S2+Aerial NPZ tiles |
+| `opensr_model/data.py` | FusionDataset + LatentFusionDataset for NPZ tiles |
 | `train/train_vae.py` | VAE training with full paper loss (WD+MAE+GAN+LPIPS) |
 | `train/train_unet.py` | UNet denoiser training (Lightning) |
+| `train/train_vae_kl_1m.py` | VAE training for 1m aerial (KL variant) |
 | `train/train_unet_old.py` | Pre-Lightning training script backup |
+| `test/eval.py` | Evaluation on own NPZ tiles (9 metrics) |
+| `test/eval_benchmark.py` | Evaluation on opensr-test benchmark datasets |
+| `test/test-inference.py` | Single-tile inference test |
+| `test/test-inference-batch.py` | Batch inference over multiple tiles |
 | `test/test_1.py` | Inference smoke test |
+| `scripts/precompute_latents.py` | Precompute VAE latents for fast UNet training |
+| `scripts/patch_vae_in_unet_ckpt.py` | Patch VAE weights into UNet checkpoint |
+| `opensr_model/configs/config_1m.yaml` | Config for 1m aerial (1024×1024) |
+| `opensr_model/configs/config_1m_64.yaml` | Alternative 1m config (64×64 latent) |
+| `opensr_model/configs/config_opensr.yaml` | Config for official OpenSR pretrained model |
+| `augment_npz.py` | Offline NPZ data augmentation |
+| `ae-test.py` | Autoencoder reconstruction test |
+| `view-latent-space.py` | Latent space visualization |
 | `CHANGES.md` | This changelog |
 | `flow.md` | Pipeline flow documentation |
 
 ### Modified files
 | File | Change |
 |---|---|
-| `opensr_model/srmodel.py` | S1+S2 fusion encode/decode, dynamic config |
+| `opensr_model/srmodel.py` | S1+S2 fusion, scale_factor=0.18215, CFG support, `_ddim_step()` |
 | `opensr_model/utils.py` | Added normalize_s1/s2/aerial functions |
-| `opensr_model/configs/config_10m.yaml` | scale_factor=2, in_channels=10 |
-| `opensr_model/autoencoder/autoencoder.py` | Gradient checkpointing (server) |
+| `opensr_model/configs/config_10m.yaml` | scale_factor=2, in_channels=10, linear_end=0.01 |
+| `opensr_model/autoencoder/autoencoder.py` | Gradient checkpointing in Encoder/Decoder |
+| `opensr_model/data.py` | S2_KEYS BGR→RGB, HR_PAD_SIZE=1024, LatentFusionDataset |
 | `requirements.txt` | Modernized dependencies |
 | `README.md` | Training & deployment docs |
 
-### Unchanged files
+### Unchanged architecture files
 | File | Note |
 |---|---|
-| `opensr_model/diffusion/` | Diffusion framework (LatentDiffusion, DDPM, DDIM) untouched |
-| `opensr_model/denoiser/` | UNet architecture untouched |
+| `opensr_model/diffusion/latentdiffusion.py` | Diffusion framework (LatentDiffusion, DDPM) untouched |
+| `opensr_model/denoiser/unet.py` | UNet architecture untouched |
+| `opensr_model/denoiser/utils.py` | ResBlock, attention, transformer blocks untouched |
 | `opensr_model/autoencoder/utils.py` | ResnetBlock, attention, etc. untouched |
 
 ---
 
-## Pipeline Dimensions (verified)
+## Pipeline Dimensions — 5m Model (verified)
 
 ```
 Input:          s1 (B, 2, 128, 128)   s2 (B, 4, 128, 128)   aerial (B, 4, 256, 256)
@@ -258,6 +430,17 @@ Conditioning:   (B, 6, 64, 64)  = 4ch VAE(S2) + 2ch S1
 UNet input:     (B, 10, 64, 64) = 4ch z_t + 6ch conditioning
 Noise pred:     (B, 4, 64, 64)
 SR output:      (B, 4, 200, 200) after removing padding
+```
+
+## Pipeline Dimensions — 1m Model
+
+```
+Input:          s1 (B, 2, 128, 128)   s2 (B, 4, 128, 128)   aerial (B, 4, 1024, 1024)
+Aerial latent:  z_0 (B, 4, 128, 128)
+Conditioning:   (B, 6, 128, 128) = 4ch VAE(S2) + 2ch S1
+UNet input:     (B, 10, 128, 128) = 4ch z_t + 6ch conditioning
+Noise pred:     (B, 4, 128, 128)
+SR output:      (B, 4, 1000, 1000) after removing padding
 ```
 
 ## Model Size
