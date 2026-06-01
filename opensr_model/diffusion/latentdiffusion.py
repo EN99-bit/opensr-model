@@ -202,14 +202,8 @@ class DDPM(nn.Module):
         if exists(given_betas):
             betas = given_betas
         else:
-            betas = make_beta_schedule(
-                beta_schedule,
-                timesteps,
-                linear_start=linear_start,
-                linear_end=linear_end,
-                cosine_s=cosine_s,
-            )
-        alphas = 1.0 - betas
+            betas = make_beta_schedule(beta_schedule, timesteps, linear_start=linear_start, linear_end=linear_end, cosine_s=cosine_s)
+        alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
         alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
 
@@ -328,7 +322,7 @@ class DDPM(nn.Module):
                 if context is not None:
                     print(f"{context}: Restored training weights")
 
-    
+
     def decode_first_stage(self, z: torch.Tensor) -> torch.Tensor:
         """
         Decodes the first stage of the model.
@@ -380,7 +374,7 @@ class DDPM(nn.Module):
                 decoded = fold(o)
                 decoded = decoded / normalization  # norm is shape (1, 1, h, w)
                 return decoded
-            
+
             else:
                 return self.first_stage_model.decode(z)
 
@@ -545,7 +539,7 @@ class LatentDiffusion(DDPM):
         ).long()
         self.cond_ids[: self.num_timesteps_cond] = ids
 
-    
+
     def encode_first_stage(self, x: torch.Tensor) -> torch.Tensor:
         """
         Encodes the given input tensor with the first stage of the model.
@@ -558,7 +552,7 @@ class LatentDiffusion(DDPM):
         """
         return self.first_stage_model.encode(x)
 
-    
+
     def get_first_stage_encoding(
         self, encoder_posterior: Union[DiagonalGaussianDistribution, torch.Tensor]
     ) -> torch.Tensor:
@@ -607,7 +601,7 @@ class LatentDiffusion(DDPM):
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
             c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
         return c
-    
+
     def get_input(
         self,
         batch: torch.Tensor,
@@ -644,7 +638,7 @@ class LatentDiffusion(DDPM):
         x = x.to(self.device)
 
         # perform always for HR and for HR only of SISR
-        if self.sr_type == "SISR" or k == "image":            
+        if self.sr_type == "SISR" or k == "image":
                 encoder_posterior = self.encode_first_stage(x)
                 z = self.get_first_stage_encoding(encoder_posterior).detach()
 
@@ -704,10 +698,10 @@ class LatentDiffusion(DDPM):
             c = self.encode_first_stage(c).sample()
             out[1] = c
         """
-        
+
 
         return out
-    
+
     def compute(
         self, example: torch.Tensor, custom_steps: int = 200, temperature: float = 1.0
     ) -> torch.Tensor:
