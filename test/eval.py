@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image
 from skimage.metrics import structural_similarity, peak_signal_noise_ratio
+from skimage.exposure import match_histograms
 from tqdm import tqdm
 
 try:
@@ -49,7 +50,7 @@ ORIG_LR = 100
 ORIG_HR = 200
 
 METRIC_KEYS = ["reflectance", "spectral", "spatial", "synthesis",
-               "ha_metric", "om_metric", "im_metric", "psnr", "ssim"]
+               "ha_metric", "om_metric", "im_metric", "psnr", "ssim", "lpips"]
 
 METRIC_LABELS = {
     "reflectance": "Reflectance ↓",
@@ -61,7 +62,39 @@ METRIC_LABELS = {
     "im_metric":   "Improvement ↑",
     "psnr":        "PSNR ↑",
     "ssim":        "SSIM ↑",
+    "lpips":       "LPIPS ↓",
 }
+
+_LPIPS_MODEL = None  # cached singleton; False if unavailable
+
+
+def lpips_score(sr_norm, hr_norm, device):
+    """LPIPS (VGG), RGB only. Inputs (C,H,W) in [0,1]; lower is better."""
+    global _LPIPS_MODEL
+    if _LPIPS_MODEL is False:
+        return float("nan")
+    if _LPIPS_MODEL is None:
+        try:
+            import lpips
+            _LPIPS_MODEL = lpips.LPIPS(net="vgg").to(device).eval()
+            for p in _LPIPS_MODEL.parameters():
+                p.requires_grad = False
+        except Exception as e:
+            print(f"  LPIPS unavailable ({e}); reporting NaN for lpips.")
+            _LPIPS_MODEL = False
+            return float("nan")
+    sr = sr_norm[:3].unsqueeze(0).to(device) * 2.0 - 1.0
+    hr = hr_norm[:3].unsqueeze(0).to(device) * 2.0 - 1.0
+    with torch.no_grad():
+        return float(_LPIPS_MODEL(sr, hr).item())
+
+
+def hist_match(sr, hr):
+    """Per-channel histogram-match SR to the GT colour distribution. Both (C,H,W) in [0,1]."""
+    sr_np = sr.cpu().numpy().transpose(1, 2, 0)
+    hr_np = hr.cpu().numpy().transpose(1, 2, 0)
+    matched = match_histograms(sr_np, hr_np, channel_axis=-1)
+    return torch.from_numpy(np.ascontiguousarray(matched.transpose(2, 0, 1))).float()
 
 
 def tensor_to_rgb(t):
@@ -107,6 +140,10 @@ def main():
     parser.add_argument("--include", type=str, default="all", choices=["all", "s1", "s2"],
                         help="Modalities to use: all, s1 only, s2 only")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--config", type=str, default=None,
+                        help="Config yaml (default: config_10m.yaml). Use config_10m_no_s1.yaml for the no-S1 model.")
+    parser.add_argument("--no_s1", action="store_true",
+                        help="S2-only conditioning (4ch, no S1 concat) for the trained no-S1 UNet.")
     parser.add_argument("--out_csv", type=str, default=None,
                         help="Optional path to save per-tile CSV results")
     parser.add_argument("--out_dir", type=str, default=str(ROOT / "test" / "results"),
@@ -114,6 +151,9 @@ def main():
     parser.add_argument("--opensr", action="store_true",
                         help="Use the official OpenSR pretrained model (S2-only, 8-ch UNet); "
                              "downloads from HuggingFace on first run")
+    parser.add_argument("--histogram_match", action="store_true",
+                        help="Histogram-match the SR to the GT colours before scoring, so the "
+                             "metrics measure detail rather than the colour translation")
     args = parser.parse_args()
 
     if args.opensr and args.ckpt is not None:
@@ -126,14 +166,15 @@ def main():
               "(official model was not trained with CFG)")
         args.guidance = 1.0
 
+    hm_suffix = "_histmatch" if args.histogram_match else ""
     if args.opensr:
-        run_dir = pathlib.Path(args.out_dir) / f"opensr_eval_steps{args.steps}_gs{args.guidance}"
+        run_dir = pathlib.Path(args.out_dir) / f"opensr_eval_steps{args.steps}_gs{args.guidance}{hm_suffix}"
     else:
         ckpt_stem = pathlib.Path(args.ckpt).stem
         m = re.search(r'epoch=(\d+).*val_loss=([\d.]+)', ckpt_stem)
         ckpt_label = f"e{int(m.group(1))}-val{m.group(2)}" if m else ckpt_stem
         modality_suffix = f"_{args.include}only" if args.include != "all" else ""
-        run_dir = pathlib.Path(args.out_dir) / f"{ckpt_label}_eval_steps{args.steps}_gs{args.guidance}{modality_suffix}"
+        run_dir = pathlib.Path(args.out_dir) / f"{ckpt_label}_eval_steps{args.steps}_gs{args.guidance}{modality_suffix}{hm_suffix}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {run_dir}")
 
@@ -143,6 +184,9 @@ def main():
     # Build model
     if args.opensr:
         cfg = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_opensr.yaml")
+    elif args.config:
+        _cp = pathlib.Path(args.config)
+        cfg = OmegaConf.load(_cp if _cp.is_absolute() else ROOT / _cp)
     else:
         cfg = OmegaConf.load(ROOT / "opensr_model" / "configs" / "config_10m.yaml")
     model = SRLatentDiffusion(cfg, device=device)
@@ -173,6 +217,18 @@ def main():
     else:
         print(f"Loading checkpoint: {args.ckpt}")
         load_trained_weights(model, args.ckpt)
+        if args.no_s1:
+            # Trained no-S1 UNet (8ch = 4 noise + 4 S2): conditioning is the 4ch S2
+            # latent only, mirroring the S2 branch of _tensor_encode (no S1 concat).
+            def _s2_only_encode(X_s2, X_s1):
+                model._X_s2 = X_s2.clone()
+                hr_size = X_s2.shape[-1] * model.scale_factor
+                X_s2_norm = normalize_s2(X_s2, stage="norm")
+                X_s2_up = F.interpolate(X_s2_norm, size=(hr_size, hr_size),
+                                        mode="bilinear", align_corners=False)
+                return model.model.first_stage_model.encode(X_s2_up).mode().to(model.device)
+            model._tensor_encode = _s2_only_encode
+            print("Conditioning: S2-only (4ch, no S1)")
     model.eval()
 
     # Ablation: zero out S1 or S2 conditioning channels
@@ -222,11 +278,10 @@ def main():
         # Crop padding to native sizes
         s2_crop = s2[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]
         s1_crop = s1[:, :, lr_pad:lr_pad + ORIG_LR, lr_pad:lr_pad + ORIG_LR]
-        if args.opensr:
-            _sr_pad = lr_pad * 4  # 14 * 4 = 56 — native content offset at 4× scale
-            sr_crop = sr[:, :, _sr_pad:_sr_pad + ORIG_HR, _sr_pad:_sr_pad + ORIG_HR].cpu()
-        else:
-            sr_crop = sr[:, :, hr_pad:hr_pad + ORIG_HR, hr_pad:hr_pad + ORIG_HR].cpu()
+        # Native content offset in the SR scales with the model's factor (lr_pad * scale).
+        # 5m model: scale 2 -> offset 28, output 256. opensr: scale 4 -> offset 56, output 512.
+        _sr_off = lr_pad * int(model.scale_factor)
+        sr_crop = sr[:, :, _sr_off:_sr_off + ORIG_HR, _sr_off:_sr_off + ORIG_HR].cpu()
         aerial_crop = aerial[:, :, hr_pad:hr_pad + ORIG_HR, hr_pad:hr_pad + ORIG_HR]
 
         # Normalize to [0, 1] for opensr_test
@@ -236,6 +291,9 @@ def main():
         sr_norm = (sr_crop[0] / 255.0).clamp(0, 1)
         # HR: aerial is [0, 255] uint8-origin
         hr_norm = (aerial_crop[0] / 255.0).clamp(0, 1)
+
+        if args.histogram_match:
+            sr_norm = hist_match(sr_norm, hr_norm)
 
         # opensr-test metrics
         try:
@@ -256,6 +314,7 @@ def main():
             row[k] = float(result.get(k, float("nan")))
         row["psnr"] = float(psnr)
         row["ssim"] = float(ssim)
+        row["lpips"] = lpips_score(sr_norm, hr_norm, device)
         rows.append(row)
 
         # Save comparison image: S1 | S2 | SR | GT
@@ -288,12 +347,16 @@ def main():
         print(f"  {METRIC_LABELS[k]:<22}  {mean:8.4f} ± {std:.4f}")
     print("=" * 52)
 
-    # Save CSV
+    # Save CSV (per-tile rows + mean/std aggregate rows)
+    mean_row = {"tile": "mean", **{k: float(np.nanmean([r[k] for r in rows])) for k in METRIC_KEYS}}
+    std_row  = {"tile": "std",  **{k: float(np.nanstd([r[k] for r in rows]))  for k in METRIC_KEYS}}
     out = pathlib.Path(args.out_csv) if args.out_csv else run_dir / "metrics.csv"
     with open(out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["tile"] + METRIC_KEYS)
         writer.writeheader()
         writer.writerows(rows)
+        writer.writerow(mean_row)
+        writer.writerow(std_row)
     print(f"\nPer-tile results saved to {out}")
 
 

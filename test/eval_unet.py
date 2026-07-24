@@ -307,7 +307,7 @@ def write_final_outputs(args, rows, run_dir, t_fracs, T, stage, cmd_line):
     n_tiles = len({r["tile"] for r in rows})
     no_opensr = getattr(args, "no_opensr_test", False)
 
-    out_csv = run_dir / "metrics.csv"
+    out_csv = run_dir / "metrics_oracle.csv"
     fields = ["tile", "t_frac", "t", *UNET_METRICS]
     with open(out_csv, "w", newline="") as f:
         f.write(f"# {cmd_line}\n")
@@ -344,7 +344,7 @@ def write_final_outputs(args, rows, run_dir, t_fracs, T, stage, cmd_line):
 
 def write_shard_csv(rows, run_dir, shard_idx):
     """Per-shard partial CSV (no command line, no aggregates). Merged by the parent."""
-    out = run_dir / f"metrics.shard{shard_idx}.csv"
+    out = run_dir / f"metrics_oracle.shard{shard_idx}.csv"
     fields = ["tile", "t_frac", "t", *UNET_METRICS]
     with open(out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -410,7 +410,7 @@ def run_multi_gpu(args, t_fracs, n_devices):
     # Merge
     all_rows = []
     for i in range(n_devices):
-        shard_csv = run_dir / f"metrics.shard{i}.csv"
+        shard_csv = run_dir / f"metrics_oracle.shard{i}.csv"
         all_rows.extend(read_shard_csv(shard_csv))
         shard_csv.unlink()
     # T from config (no model loaded in parent)

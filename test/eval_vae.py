@@ -47,6 +47,29 @@ from opensr_model.autoencoder.autoencoder import AutoencoderKL
 from opensr_model.data import FusionDataset
 from opensr_model.utils import normalize_aerial
 
+_LPIPS_MODEL = None  # cached singleton; False if the package is unavailable
+
+
+def lpips_score(sr_norm, hr_norm, device):
+    """LPIPS (VGG) between reconstruction and original, RGB only. Inputs (C,H,W) in [0,1]."""
+    global _LPIPS_MODEL
+    if _LPIPS_MODEL is False:
+        return float("nan")
+    if _LPIPS_MODEL is None:
+        try:
+            import lpips
+            _LPIPS_MODEL = lpips.LPIPS(net="vgg").to(device).eval()
+            for p in _LPIPS_MODEL.parameters():
+                p.requires_grad = False
+        except Exception as e:
+            print(f"  LPIPS unavailable ({e}); reporting NaN for lpips.")
+            _LPIPS_MODEL = False
+            return float("nan")
+    sr = sr_norm[:3].unsqueeze(0).to(device) * 2.0 - 1.0
+    hr = hr_norm[:3].unsqueeze(0).to(device) * 2.0 - 1.0
+    with torch.no_grad():
+        return float(_LPIPS_MODEL(sr, hr).item())
+
 
 def infer_vae_config(vae_state: dict) -> dict:
     """Recover the AutoencoderKL ddconfig from a checkpoint's tensor shapes.
@@ -209,13 +232,21 @@ def main():
         psnr = peak_signal_noise_ratio(hr_u8, sr_u8, data_range=255)
         ssim = structural_similarity(hr_u8, sr_u8, channel_axis=2, data_range=255)
 
-        rows.append({"tile": name, "psnr": float(psnr), "ssim": float(ssim)})
+        # MAE on the normalized [-1, 1] reconstruction (all 4 channels)
+        mae = float((recon - x).abs().mean())
+        # LPIPS (VGG) on RGB, inputs mapped to [0, 1]
+        sr01 = (recon[0].clamp(-1, 1) + 1) / 2
+        hr01 = (x[0].clamp(-1, 1) + 1) / 2
+        lp = lpips_score(sr01, hr01, device)
+
+        rows.append({"tile": name, "psnr": float(psnr), "ssim": float(ssim),
+                     "mae": mae, "lpips": lp})
 
         if args.save_visual:
             save_comparison(hr_u8, sr_u8, name, visuals_dir)
 
     # Aggregate mean / std once so the CSV summary rows and the stdout print can't drift.
-    agg = {k: np.array([r[k] for r in rows], dtype=np.float64) for k in ("psnr", "ssim")}
+    agg = {k: np.array([r[k] for r in rows], dtype=np.float64) for k in ("psnr", "ssim", "mae", "lpips")}
     mean_row = {"tile": "mean", **{k: float(v.mean()) for k, v in agg.items()}}
     std_row  = {"tile": "std",  **{k: float(v.std())  for k, v in agg.items()}}
 
@@ -226,7 +257,7 @@ def main():
     with open(out_csv, "w", newline="") as f:
         f.write(f"# {cmd_line}\n")
         f.write(f"# effective: pad_size={pad_str} tiles={len(rows)}\n")
-        writer = csv.DictWriter(f, fieldnames=["tile", "psnr", "ssim"])
+        writer = csv.DictWriter(f, fieldnames=["tile", "psnr", "ssim", "mae", "lpips"])
         writer.writeheader()
         writer.writerows(rows)
         writer.writerow(mean_row)
@@ -234,7 +265,7 @@ def main():
 
     # Summary
     print(f"\n  VAE reconstruction over {len(rows)} tiles")
-    for k, label in [("psnr", "PSNR ↑"), ("ssim", "SSIM ↑")]:
+    for k, label in [("psnr", "PSNR ↑"), ("ssim", "SSIM ↑"), ("mae", "MAE ↓"), ("lpips", "LPIPS ↓")]:
         print(f"  {label:<10}  {mean_row[k]:8.4f} ± {std_row[k]:.4f}")
     print(f"\nPer-tile results saved to {out_csv}")
 

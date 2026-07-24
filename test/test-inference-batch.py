@@ -95,8 +95,9 @@ def main():
                         help="Parent directory for output folder")
     parser.add_argument("--device", type=str, default=None,
                         help="Device to run on: 'cuda' or 'cpu' (default: auto-detect)")
-    parser.add_argument("--include", type=str, default="all", choices=["all", "s1", "s2"],
-                        help="Which modalities to use: 'all' (S1+S2), 's1' only, 's2' only (default: all)")
+    parser.add_argument("--include", type=str, default="all", choices=["all", "s1", "s2", "none"],
+                        help="Which modalities to use: 'all' (S1+S2), 's1' only, 's2' only, "
+                             "'none' (both zeroed — unconditional baseline) (default: all)")
     parser.add_argument("--opensr", action="store_true",
                         help="Use official OpenSR pretrained weights (S2-only, 8-ch UNet); "
                              "downloads from HuggingFace on first run")
@@ -172,15 +173,20 @@ def main():
             if args.include == "s1":
                 def _patched_encode(X_s2, X_s1):
                     cond = _original_encode(X_s2, X_s1)
-                    cond[:, :4] = 0
+                    cond[:, :4] = 0   # zero S2 latent, keep S1
                     return cond
-            else:
+            elif args.include == "s2":
                 def _patched_encode(X_s2, X_s1):
                     cond = _original_encode(X_s2, X_s1)
-                    cond[:, 4:] = 0
+                    cond[:, 4:] = 0   # zero S1, keep S2 latent
+                    return cond
+            else:  # none — zero entire conditioning (unconditional baseline)
+                def _patched_encode(X_s2, X_s1):
+                    cond = _original_encode(X_s2, X_s1)
+                    cond[:] = 0
                     return cond
             model._tensor_encode = _patched_encode
-            print(f"Ablation: using {args.include} only (other modality zeroed in conditioning)")
+            print(f"Ablation: include={args.include} (other modality zeroed in conditioning)")
     model.eval()
 
     # Determine display geometry based on model's scale_factor.
