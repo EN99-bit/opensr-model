@@ -1,0 +1,7 @@
+checkpoint files are on huggingface at https://huggingface.co/jakoblund1/aragorn/
+
+The program ESA SNAP can be used to view .SAFE files, which are the raw files downloaded from the Copernicus Browser Website
+
+Inside the scripts folder there is another txt file that introduces some of the scripts.
+
+Within most of the folders in the test/results folder there are additional explanations in the files named what_is_this.txt
